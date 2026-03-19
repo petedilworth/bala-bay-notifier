@@ -1,0 +1,30 @@
+name: Daily Bala Bay Water Level
+
+on:
+  schedule:
+    # Run daily at 7:00 AM Eastern Time
+    # GitHub Actions uses UTC, so 7am ET = 12:00 UTC (EST) or 11:00 UTC (EDT)
+    # Using 11:00 UTC to cover EDT (summer), which means 7am in summer, 6am in winter
+    - cron: '0 11 * * *'
+
+  # Allow manual trigger for testing
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Send water level notification
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+        run: node notify.mjs
