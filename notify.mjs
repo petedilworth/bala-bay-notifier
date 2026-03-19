@@ -17,8 +17,8 @@ const API_BASE = 'https://api.weather.gc.ca/collections';
 const JULY_YEARS = [2021, 2022, 2023, 2024, 2025];
 
 // Bala Bay coordinates for satellite SST lookup
-const BALA_LAT = 44.99;
-const BALA_LON = -79.62;
+const BALA_LAT = 45.01;
+const BALA_LON = -79.60;
 const ERDDAP_BASE = 'https://coastwatch.pfeg.noaa.gov/erddap/griddap';
 
 // ── Configuration (from environment variables) ──
