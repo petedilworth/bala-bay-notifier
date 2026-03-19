@@ -1,0 +1,278 @@
+/**
+ * Bala Bay Daily Water Level Notification
+ *
+ * Fetches the latest water level from Environment Canada's OGC API,
+ * compares it to the 5-year July average, and sends a formatted
+ * email via Resend.
+ *
+ * Data source: MSC GeoMet OGC API (api.weather.gc.ca)
+ * Station: 02EB015 — Bala Bay at Bala (Lake Muskoka)
+ */
+
+const STATION = '02EB015';
+const API_BASE = 'https://api.weather.gc.ca/collections';
+const JULY_YEARS = [2021, 2022, 2023, 2024, 2025];
+
+// ── Configuration (from environment variables) ──
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const EMAIL_TO = (process.env.EMAIL_TO || '').split(',').map(e => e.trim()).filter(Boolean);
+const EMAIL_FROM = process.env.EMAIL_FROM || 'Bala Bay <onboarding@resend.dev>';
+
+// ── Fetch helpers ──
+
+async function fetchJSON(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} from ${url}`);
+  return resp.json();
+}
+
+async function fetchAllFeatures(buildUrl, maxPages = 20) {
+  const size = 500;
+  let all = [];
+  for (let p = 0; p < maxPages; p++) {
+    const url = buildUrl(size, p * size);
+    const data = await fetchJSON(url);
+    const feats = data.features || [];
+    all = all.concat(feats);
+    if (feats.length < size) break;
+  }
+  return all;
+}
+
+// ── Parsers ──
+
+function parseRealtimeFeatures(features) {
+  const dayMap = {};
+  for (const f of features) {
+    const p = f.properties || {};
+    if (p.LEVEL == null) continue;
+    const d = (p.DATETIME || '').substring(0, 10);
+    if (!d) continue;
+    if (!dayMap[d]) dayMap[d] = [];
+    dayMap[d].push(p.LEVEL);
+  }
+  return Object.entries(dayMap)
+    .map(([date, v]) => ({ date, value: v.reduce((a, b) => a + b, 0) / v.length }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function parseDailyFeatures(features) {
+  const results = [];
+  for (const f of features) {
+    const p = f.properties || {};
+    if (p.LEVEL == null) continue;
+    const date = (p.DATE || '').substring(0, 10);
+    if (date) results.push({ date, value: p.LEVEL });
+  }
+  return results.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+// ── Outlier filter ──
+
+function filterOutliers(data) {
+  if (data.length < 4) return data;
+  const clean = [data[0]];
+  for (let i = 1; i < data.length - 1; i++) {
+    const avg = (data[i - 1].value + data[i + 1].value) / 2;
+    if (Math.abs(data[i].value - avg) > 0.5) {
+      console.log(`  Outlier removed: ${data[i].date} = ${data[i].value}m`);
+      continue;
+    }
+    clean.push(data[i]);
+  }
+  clean.push(data[data.length - 1]);
+  return clean;
+}
+
+// ── Main ──
+
+async function main() {
+  console.log('🌊 Bala Bay Daily Water Level Notification');
+  console.log('──────────────────────────────────────────');
+
+  // Validate config
+  if (!RESEND_API_KEY) throw new Error('Missing RESEND_API_KEY');
+  if (EMAIL_TO.length === 0) throw new Error('Missing EMAIL_TO');
+
+  // 1. Fetch recent realtime data (~30 days)
+  console.log('Fetching realtime data...');
+  const rtFeats = await fetchAllFeatures(
+    (lim, off) => `${API_BASE}/hydrometric-realtime/items?f=json&STATION_NUMBER=${STATION}&limit=${lim}&offset=${off}`,
+    20
+  );
+  console.log(`  ${rtFeats.length} raw readings`);
+  let recentData = parseRealtimeFeatures(rtFeats);
+  recentData = filterOutliers(recentData);
+  console.log(`  ${recentData.length} days after averaging & cleaning`);
+
+  if (recentData.length === 0) {
+    throw new Error('No water level data available from realtime API');
+  }
+
+  const latest = recentData[recentData.length - 1];
+  console.log(`  Latest: ${latest.date} = ${latest.value.toFixed(3)}m`);
+
+  // 2. Compute trend (7-day change if available)
+  let trend = null;
+  let trendArrow = '';
+  if (recentData.length >= 7) {
+    const weekAgo = recentData[recentData.length - 7];
+    trend = (latest.value - weekAgo.value) * 100; // in cm
+    trendArrow = trend > 0.5 ? '↗ rising' : trend < -0.5 ? '↘ falling' : '→ stable';
+    console.log(`  7-day trend: ${trend > 0 ? '+' : ''}${trend.toFixed(1)}cm (${trendArrow})`);
+  }
+
+  // 3. Compute 5-year July average
+  console.log('Fetching July averages...');
+  let julyVals = [];
+  for (const yr of JULY_YEARS) {
+    try {
+      const feats = await fetchAllFeatures(
+        (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${STATION}&datetime=${yr}-07-01/${yr}-07-31&limit=${lim}&offset=${off}`,
+        1
+      );
+      const parsed = parseDailyFeatures(feats);
+      console.log(`  July ${yr}: ${parsed.length} days`);
+      for (const d of parsed) julyVals.push(d.value);
+    } catch (e) {
+      console.log(`  July ${yr}: unavailable`);
+    }
+  }
+
+  let julyAvg = null;
+  let deltaCm = null;
+  let deltaSign = '';
+  let deltaNote = '';
+
+  if (julyVals.length > 0) {
+    julyAvg = julyVals.reduce((a, b) => a + b, 0) / julyVals.length;
+    deltaCm = (latest.value - julyAvg) * 100;
+    deltaSign = deltaCm >= 0 ? '+' : '';
+    deltaNote = deltaCm > 10 ? 'Above normal summer level'
+      : deltaCm < -10 ? 'Below normal summer level'
+      : deltaCm > 0 ? 'Slightly above normal'
+      : deltaCm < 0 ? 'Slightly below normal'
+      : 'At normal summer level';
+    console.log(`  July avg: ${julyAvg.toFixed(3)}m | Delta: ${deltaSign}${deltaCm.toFixed(1)}cm`);
+  }
+
+  // 4. Build and send email
+  console.log('Sending email...');
+
+  const dateStr = new Date(latest.date + 'T12:00:00').toLocaleDateString('en-CA', {
+    weekday: 'long', month: 'long', day: 'numeric', year: 'numeric'
+  });
+
+  // Sparkline: last 14 days as simple bar indicators
+  const last14 = recentData.slice(-14);
+  const minVal = Math.min(...last14.map(d => d.value));
+  const maxVal = Math.max(...last14.map(d => d.value));
+  const range = maxVal - minVal || 0.01;
+
+  const sparkBars = last14.map(d => {
+    const pct = ((d.value - minVal) / range) * 100;
+    const height = Math.max(4, Math.round(pct * 0.4 + 4)); // 4–44px
+    return `<td style="vertical-align:bottom;padding:0 1px;">
+      <div style="width:8px;height:${height}px;background:#4A9BD9;border-radius:2px;"></div>
+    </td>`;
+  }).join('');
+
+  const deltaColor = deltaCm > 10 ? '#E07B4C'
+    : deltaCm < -10 ? '#2D6A9F'
+    : '#5BA88A';
+
+  const html = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#F4F0EB;">
+  <div style="max-width:480px;margin:0 auto;padding:24px 16px;">
+
+    <!-- Header -->
+    <div style="margin-bottom:20px;">
+      <h1 style="margin:0;font-size:20px;color:#0B1D33;">🌊 Bala Bay</h1>
+      <p style="margin:4px 0 0;font-size:13px;color:#6B6B6B;">${dateStr}</p>
+    </div>
+
+    <!-- Main card -->
+    <div style="background:#fff;border:1px solid #E0DAD2;border-radius:12px;padding:20px;margin-bottom:16px;">
+
+      <!-- Current level -->
+      <div style="margin-bottom:16px;">
+        <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:4px;">Current Level</div>
+        <div style="font-size:28px;font-weight:700;color:#0B1D33;">${latest.value.toFixed(3)}<span style="font-size:14px;color:#6B6B6B;margin-left:2px;">m</span></div>
+      </div>
+
+      ${julyAvg !== null ? `
+      <!-- Delta -->
+      <div style="background:#F8F6F2;border-radius:8px;padding:12px 16px;margin-bottom:16px;">
+        <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:4px;">vs 5-Year July Average</div>
+        <div style="font-size:24px;font-weight:700;color:${deltaColor};">${deltaSign}${deltaCm.toFixed(1)} cm</div>
+        <div style="font-size:12px;color:#6B6B6B;margin-top:2px;">${deltaNote} · July avg: ${julyAvg.toFixed(3)}m</div>
+      </div>
+      ` : ''}
+
+      ${trend !== null ? `
+      <!-- Trend -->
+      <div style="font-size:13px;color:#6B6B6B;margin-bottom:16px;">
+        <strong>7-day trend:</strong> ${trend > 0 ? '+' : ''}${trend.toFixed(1)} cm ${trendArrow}
+      </div>
+      ` : ''}
+
+      <!-- Sparkline -->
+      <div style="margin-top:8px;">
+        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:6px;">Last ${last14.length} days</div>
+        <table style="border-collapse:collapse;"><tr>${sparkBars}</tr></table>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <div style="text-align:center;font-size:11px;color:#6B6B6B;line-height:1.5;">
+      Station 02EB015 · Lake Muskoka, Ontario<br>
+      Data: Environment Canada, MSC Open Data
+    </div>
+  </div>
+</body>
+</html>`;
+
+  // Plain text fallback
+  const text = [
+    `🌊 Bala Bay Water Level — ${dateStr}`,
+    ``,
+    `Current: ${latest.value.toFixed(3)} m`,
+    julyAvg !== null ? `vs July avg: ${deltaSign}${deltaCm.toFixed(1)} cm (${deltaNote})` : '',
+    trend !== null ? `7-day trend: ${trend > 0 ? '+' : ''}${trend.toFixed(1)} cm ${trendArrow}` : '',
+    ``,
+    `Station 02EB015 · Lake Muskoka · Environment Canada`,
+  ].filter(Boolean).join('\n');
+
+  // Send via Resend
+  const emailResp = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: EMAIL_FROM,
+      to: EMAIL_TO,
+      subject: `🌊 Bala Bay: ${latest.value.toFixed(2)}m (${deltaSign}${deltaCm?.toFixed(1) ?? '?'}cm vs July)`,
+      html: html,
+      text: text,
+    }),
+  });
+
+  if (!emailResp.ok) {
+    const err = await emailResp.text();
+    throw new Error(`Resend API error: ${emailResp.status} — ${err}`);
+  }
+
+  const result = await emailResp.json();
+  console.log(`✅ Email sent! ID: ${result.id}`);
+  console.log(`   To: ${EMAIL_TO.join(', ')}`);
+}
+
+main().catch(err => {
+  console.error('❌ Error:', err.message);
+  process.exit(1);
+});
