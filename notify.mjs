@@ -1,17 +1,25 @@
 /**
  * Bala Bay Daily Water Level Notification
  *
- * Fetches the latest water level from Environment Canada's OGC API,
- * compares it to the 5-year July average, and sends a formatted
+ * Fetches the latest water level from Environment Canada's OGC API
+ * and water temperature from NOAA MUR SST satellite data,
+ * compares levels to the 5-year July average, and sends a formatted
  * email via Resend.
  *
- * Data source: MSC GeoMet OGC API (api.weather.gc.ca)
+ * Data sources:
+ *   MSC GeoMet OGC API (api.weather.gc.ca) — water levels
+ *   NOAA ERDDAP MUR SST (coastwatch.pfeg.noaa.gov) — water temperature
  * Station: 02EB015 — Bala Bay at Bala (Lake Muskoka)
  */
 
 const STATION = '02EB015';
 const API_BASE = 'https://api.weather.gc.ca/collections';
 const JULY_YEARS = [2021, 2022, 2023, 2024, 2025];
+
+// Bala Bay coordinates for satellite SST lookup
+const BALA_LAT = 44.99;
+const BALA_LON = -79.62;
+const ERDDAP_BASE = 'https://coastwatch.pfeg.noaa.gov/erddap/griddap';
 
 // ── Configuration (from environment variables) ──
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
@@ -82,6 +90,30 @@ function filterOutliers(data) {
   }
   clean.push(data[data.length - 1]);
   return clean;
+}
+
+// ── Water temperature (NOAA MUR SST satellite data) ──
+
+async function fetchWaterTemp() {
+  // MUR SST: 0.01° resolution global SST analysis, updated daily
+  // Uses "last" to get most recent available data point
+  const url = `${ERDDAP_BASE}/jplMURSST41.json?analysed_sst[(last)][(${BALA_LAT})][(${BALA_LON})]`;
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const rows = data?.table?.rows;
+    if (!rows || rows.length === 0) return null;
+    // Row format: [time, latitude, longitude, analysed_sst]
+    const sst = rows[0][3];
+    if (sst == null) return null; // land-masked or missing
+    const time = rows[0][0];
+    const date = time ? time.substring(0, 10) : null;
+    return { tempC: Math.round(sst * 10) / 10, date };
+  } catch (e) {
+    console.log(`  Water temp fetch failed: ${e.message}`);
+    return null;
+  }
 }
 
 // ── Main ──
@@ -156,7 +188,16 @@ async function main() {
     console.log(`  July avg: ${julyAvg.toFixed(3)}m | Delta: ${deltaSign}${deltaCm.toFixed(1)}cm`);
   }
 
-  // 4. Build and send email
+  // 4. Fetch water temperature (satellite SST)
+  console.log('Fetching water temperature...');
+  const waterTemp = await fetchWaterTemp();
+  if (waterTemp) {
+    console.log(`  Water temp: ${waterTemp.tempC}°C (${(waterTemp.tempC * 9/5 + 32).toFixed(0)}°F) — ${waterTemp.date}`);
+  } else {
+    console.log('  Water temperature unavailable');
+  }
+
+  // 5. Build and send email
   console.log('Sending email...');
 
   const dateStr = new Date(latest.date + 'T12:00:00').toLocaleDateString('en-CA', {
@@ -203,6 +244,14 @@ async function main() {
         <div style="font-size:28px;font-weight:700;color:#0B1D33;">${latest.value.toFixed(3)}<span style="font-size:14px;color:#6B6B6B;margin-left:2px;">m</span></div>
       </div>
 
+      ${waterTemp ? `
+      <!-- Water Temperature -->
+      <div style="margin-bottom:16px;">
+        <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:4px;">Water Temperature</div>
+        <div style="font-size:28px;font-weight:700;color:#0B1D33;">${waterTemp.tempC.toFixed(1)}<span style="font-size:14px;color:#6B6B6B;margin-left:2px;">°C</span> <span style="font-size:16px;font-weight:400;color:#6B6B6B;">(${(waterTemp.tempC * 9/5 + 32).toFixed(0)}°F)</span></div>
+      </div>
+      ` : ''}
+
       ${julyAvg !== null ? `
       <!-- Delta -->
       <div style="background:#F8F6F2;border-radius:8px;padding:12px 16px;margin-bottom:16px;">
@@ -229,7 +278,7 @@ async function main() {
     <!-- Footer -->
     <div style="text-align:center;font-size:11px;color:#6B6B6B;line-height:1.5;">
       Station 02EB015 · Lake Muskoka, Ontario<br>
-      Data: Environment Canada, MSC Open Data
+      Data: Environment Canada, MSC Open Data${waterTemp ? ' · NOAA MUR SST' : ''}
     </div>
   </div>
 </body>
@@ -240,10 +289,11 @@ async function main() {
     `🌊 Bala Bay Water Level — ${dateStr}`,
     ``,
     `Current: ${latest.value.toFixed(3)} m`,
+    waterTemp ? `Water temp: ${waterTemp.tempC.toFixed(1)}°C (${(waterTemp.tempC * 9/5 + 32).toFixed(0)}°F)` : '',
     julyAvg !== null ? `vs July avg: ${deltaSign}${deltaCm.toFixed(1)} cm (${deltaNote})` : '',
     trend !== null ? `7-day trend: ${trend > 0 ? '+' : ''}${trend.toFixed(1)} cm ${trendArrow}` : '',
     ``,
-    `Station 02EB015 · Lake Muskoka · Environment Canada`,
+    `Station 02EB015 · Lake Muskoka · Environment Canada${waterTemp ? ' · NOAA MUR SST' : ''}`,
   ].filter(Boolean).join('\n');
 
   // Send via Resend
@@ -256,7 +306,7 @@ async function main() {
     body: JSON.stringify({
       from: EMAIL_FROM,
       to: EMAIL_TO,
-      subject: `🌊 Bala Bay: ${latest.value.toFixed(2)}m (${deltaSign}${deltaCm?.toFixed(1) ?? '?'}cm vs July)`,
+      subject: `🌊 Bala Bay: ${latest.value.toFixed(2)}m (${deltaSign}${deltaCm?.toFixed(1) ?? '?'}cm vs July)${waterTemp ? ` · ${waterTemp.tempC.toFixed(0)}°C` : ''}`,
       html: html,
       text: text,
     }),
