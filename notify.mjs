@@ -126,7 +126,7 @@ async function main() {
   if (!RESEND_API_KEY) throw new Error('Missing RESEND_API_KEY');
   if (EMAIL_TO.length === 0) throw new Error('Missing EMAIL_TO');
 
-  // 1. Fetch recent realtime data (~30 days)
+  // 1. Fetch recent realtime data (~30 days) + daily-mean backfill for 60-day chart
   console.log('Fetching realtime data...');
   const rtFeats = await fetchAllFeatures(
     (lim, off) => `${API_BASE}/hydrometric-realtime/items?f=json&STATION_NUMBER=${STATION}&limit=${lim}&offset=${off}`,
@@ -139,6 +139,30 @@ async function main() {
 
   if (recentData.length === 0) {
     throw new Error('No water level data available from realtime API');
+  }
+
+  // Backfill with daily-mean data to reach 60 days for the chart
+  if (recentData.length < 60) {
+    const earliestRt = recentData[0].date;
+    const startDate = new Date(earliestRt + 'T12:00:00');
+    startDate.setDate(startDate.getDate() - (60 - recentData.length + 5)); // fetch extra overlap
+    const startStr = startDate.toISOString().substring(0, 10);
+    console.log(`Backfilling daily-mean data from ${startStr} to ${earliestRt}...`);
+    try {
+      const dailyFeats = await fetchAllFeatures(
+        (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${STATION}&datetime=${startStr}/${earliestRt}&limit=${lim}&offset=${off}`,
+        2
+      );
+      const dailyData = parseDailyFeatures(dailyFeats);
+      console.log(`  ${dailyData.length} daily-mean days fetched`);
+      // Merge: daily-mean for dates not already in recentData
+      const existingDates = new Set(recentData.map(d => d.date));
+      const backfill = dailyData.filter(d => !existingDates.has(d.date));
+      recentData = [...backfill, ...recentData].sort((a, b) => a.date.localeCompare(b.date));
+      console.log(`  ${recentData.length} total days after backfill`);
+    } catch (e) {
+      console.log(`  Daily-mean backfill failed: ${e.message} (continuing with realtime only)`);
+    }
   }
 
   const latest = recentData[recentData.length - 1];
@@ -204,19 +228,35 @@ async function main() {
     weekday: 'long', month: 'long', day: 'numeric', year: 'numeric'
   });
 
-  // Sparkline: last 14 days as simple bar indicators
-  const last14 = recentData.slice(-14);
-  const minVal = Math.min(...last14.map(d => d.value));
-  const maxVal = Math.max(...last14.map(d => d.value));
+  // Chart: last 60 days as a detailed bar chart with labels
+  const chartDays = recentData.slice(-60);
+  const minVal = Math.min(...chartDays.map(d => d.value));
+  const maxVal = Math.max(...chartDays.map(d => d.value));
   const range = maxVal - minVal || 0.01;
+  const chartHeight = 120; // px
 
-  const sparkBars = last14.map(d => {
-    const pct = ((d.value - minVal) / range) * 100;
-    const height = Math.max(4, Math.round(pct * 0.4 + 4)); // 4–44px
-    return `<td style="vertical-align:bottom;padding:0 1px;">
-      <div style="width:8px;height:${height}px;background:#4A9BD9;border-radius:2px;"></div>
+  const chartBars = chartDays.map((d, i) => {
+    const pct = (d.value - minVal) / range;
+    const height = Math.max(3, Math.round(pct * (chartHeight - 10) + 3));
+    // Highlight the most recent day
+    const color = i === chartDays.length - 1 ? '#E07B4C' : '#4A9BD9';
+    return `<td style="vertical-align:bottom;padding:0 0.5px;">
+      <div style="width:6px;height:${height}px;background:${color};border-radius:1px;" title="${d.date}: ${d.value.toFixed(3)}m"></div>
     </td>`;
   }).join('');
+
+  // Date labels: first, middle, and last
+  const firstDate = chartDays[0];
+  const midIdx = Math.floor(chartDays.length / 2);
+  const midDate = chartDays[midIdx];
+  const lastDate = chartDays[chartDays.length - 1];
+  const fmtShort = (d) => { const dt = new Date(d.date + 'T12:00:00'); return dt.toLocaleDateString('en-CA', { month: 'short', day: 'numeric' }); };
+
+  // July average reference line position (if available)
+  let refLinePct = null;
+  if (julyAvg !== null && julyAvg >= minVal && julyAvg <= maxVal) {
+    refLinePct = ((julyAvg - minVal) / range) * 100;
+  }
 
   const deltaColor = deltaCm > 10 ? '#E07B4C'
     : deltaCm < -10 ? '#2D6A9F'
@@ -227,7 +267,7 @@ async function main() {
 <html>
 <head><meta charset="utf-8"></head>
 <body style="margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#F4F0EB;">
-  <div style="max-width:480px;margin:0 auto;padding:24px 16px;">
+  <div style="max-width:560px;margin:0 auto;padding:24px 16px;">
 
     <!-- Header -->
     <div style="margin-bottom:20px;">
@@ -268,10 +308,32 @@ async function main() {
       </div>
       ` : ''}
 
-      <!-- Sparkline -->
-      <div style="margin-top:8px;">
-        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:6px;">Last ${last14.length} days</div>
-        <table style="border-collapse:collapse;"><tr>${sparkBars}</tr></table>
+      <!-- Water Level Chart -->
+      <div style="margin-top:12px;">
+        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:8px;">Water Level — Last ${chartDays.length} Days</div>
+        <div style="position:relative;">
+          <!-- Y-axis labels -->
+          <div style="display:inline-block;vertical-align:bottom;text-align:right;padding-right:6px;font-size:9px;color:#999;width:42px;">
+            <div style="margin-bottom:${chartHeight - 18}px;">${maxVal.toFixed(2)}m</div>
+            <div>${minVal.toFixed(2)}m</div>
+          </div>
+          <!-- Bars -->
+          <div style="display:inline-block;vertical-align:bottom;position:relative;border-left:1px solid #E0DAD2;border-bottom:1px solid #E0DAD2;padding-left:2px;">
+            ${refLinePct !== null ? `<div style="position:absolute;left:0;right:0;bottom:${refLinePct}%;border-top:1px dashed #5BA88A;z-index:1;"><span style="position:absolute;right:0;top:-10px;font-size:8px;color:#5BA88A;">Jul avg</span></div>` : ''}
+            <table style="border-collapse:collapse;height:${chartHeight}px;"><tr>${chartBars}</tr></table>
+          </div>
+        </div>
+        <!-- Date labels -->
+        <div style="margin-left:50px;font-size:9px;color:#999;display:flex;justify-content:space-between;margin-top:2px;">
+          <span>${fmtShort(firstDate)}</span>
+          <span>${fmtShort(midDate)}</span>
+          <span style="font-weight:600;color:#6B6B6B;">${fmtShort(lastDate)}</span>
+        </div>
+        <div style="margin-top:6px;font-size:9px;color:#999;">
+          <span style="display:inline-block;width:8px;height:8px;background:#4A9BD9;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Daily level
+          <span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Today
+          ${refLinePct !== null ? '<span style="display:inline-block;width:12px;border-top:1px dashed #5BA88A;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Jul avg' : ''}
+        </div>
       </div>
     </div>
 
