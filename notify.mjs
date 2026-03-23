@@ -170,12 +170,14 @@ async function main() {
 
   // 2. Compute trend (7-day change if available)
   let trend = null;
+  let trendIn = null;
   let trendArrow = '';
   if (recentData.length >= 7) {
     const weekAgo = recentData[recentData.length - 7];
     trend = (latest.value - weekAgo.value) * 100; // in cm
+    trendIn = trend / 2.54; // in inches
     trendArrow = trend > 0.5 ? '↗ rising' : trend < -0.5 ? '↘ falling' : '→ stable';
-    console.log(`  7-day trend: ${trend > 0 ? '+' : ''}${trend.toFixed(1)}cm (${trendArrow})`);
+    console.log(`  7-day trend: ${trendIn > 0 ? '+' : ''}${trendIn.toFixed(1)}in (${trendArrow})`);
   }
 
   // 3. Compute 5-year July average
@@ -211,6 +213,9 @@ async function main() {
       : 'At normal summer level';
     console.log(`  July avg: ${julyAvg.toFixed(3)}m | Delta: ${deltaSign}${deltaCm.toFixed(1)}cm`);
   }
+
+  // Convert delta and values to inches relative to July average
+  const deltaIn = deltaCm !== null ? deltaCm / 2.54 : null;
 
   // 4. Fetch water temperature (satellite SST)
   console.log('Fetching water temperature...');
@@ -280,8 +285,8 @@ async function main() {
 
       <!-- Current level -->
       <div style="margin-bottom:16px;">
-        <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:4px;">Current Level</div>
-        <div style="font-size:28px;font-weight:700;color:#0B1D33;">${latest.value.toFixed(3)}<span style="font-size:14px;color:#6B6B6B;margin-left:2px;">m</span></div>
+        <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:4px;">Current Level vs July Avg</div>
+        <div style="font-size:28px;font-weight:700;color:#0B1D33;">${deltaSign}${deltaIn?.toFixed(1) ?? '?'}<span style="font-size:14px;color:#6B6B6B;margin-left:2px;">in</span></div>
       </div>
 
       ${waterTemp ? `
@@ -296,15 +301,15 @@ async function main() {
       <!-- Delta -->
       <div style="background:#F8F6F2;border-radius:8px;padding:12px 16px;margin-bottom:16px;">
         <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:4px;">vs 5-Year July Average</div>
-        <div style="font-size:24px;font-weight:700;color:${deltaColor};">${deltaSign}${deltaCm.toFixed(1)} cm</div>
-        <div style="font-size:12px;color:#6B6B6B;margin-top:2px;">${deltaNote} · July avg: ${julyAvg.toFixed(3)}m</div>
+        <div style="font-size:24px;font-weight:700;color:${deltaColor};">${deltaSign}${deltaIn.toFixed(1)} in</div>
+        <div style="font-size:12px;color:#6B6B6B;margin-top:2px;">${deltaNote}</div>
       </div>
       ` : ''}
 
       ${trend !== null ? `
       <!-- Trend -->
       <div style="font-size:13px;color:#6B6B6B;margin-bottom:16px;">
-        <strong>7-day trend:</strong> ${trend > 0 ? '+' : ''}${trend.toFixed(1)} cm ${trendArrow}
+        <strong>7-day trend:</strong> ${trendIn > 0 ? '+' : ''}${trendIn.toFixed(1)} in ${trendArrow}
       </div>
       ` : ''}
 
@@ -312,19 +317,14 @@ async function main() {
       <div style="margin-top:12px;">
         <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:8px;">Water Level — Last ${chartDays.length} Days</div>
         <div style="position:relative;">
-          <!-- Y-axis labels -->
-          <div style="display:inline-block;vertical-align:bottom;text-align:right;padding-right:6px;font-size:9px;color:#999;width:42px;">
-            <div style="margin-bottom:${chartHeight - 18}px;">${maxVal.toFixed(2)}m</div>
-            <div>${minVal.toFixed(2)}m</div>
-          </div>
           <!-- Bars -->
-          <div style="display:inline-block;vertical-align:bottom;position:relative;border-left:1px solid #E0DAD2;border-bottom:1px solid #E0DAD2;padding-left:2px;">
+          <div style="display:inline-block;vertical-align:bottom;position:relative;border-bottom:1px solid #E0DAD2;padding-left:2px;">
             ${refLinePct !== null ? `<div style="position:absolute;left:0;right:0;bottom:${refLinePct}%;border-top:1px dashed #5BA88A;z-index:1;"><span style="position:absolute;right:0;top:-10px;font-size:8px;color:#5BA88A;">Jul avg</span></div>` : ''}
             <table style="border-collapse:collapse;height:${chartHeight}px;"><tr>${chartBars}</tr></table>
           </div>
         </div>
         <!-- Date labels -->
-        <div style="margin-left:50px;font-size:9px;color:#999;display:flex;justify-content:space-between;margin-top:2px;">
+        <div style="font-size:9px;color:#999;display:flex;justify-content:space-between;margin-top:2px;">
           <span>${fmtShort(firstDate)}</span>
           <span>${fmtShort(midDate)}</span>
           <span style="font-weight:600;color:#6B6B6B;">${fmtShort(lastDate)}</span>
@@ -350,10 +350,10 @@ async function main() {
   const text = [
     `🌊 Bala Bay Water Level — ${dateStr}`,
     ``,
-    `Current: ${latest.value.toFixed(3)} m`,
+    `Current: ${deltaSign}${deltaIn?.toFixed(1) ?? '?'} in vs July avg`,
     waterTemp ? `Water temp: ${waterTemp.tempC.toFixed(1)}°C (${(waterTemp.tempC * 9/5 + 32).toFixed(0)}°F)` : '',
-    julyAvg !== null ? `vs July avg: ${deltaSign}${deltaCm.toFixed(1)} cm (${deltaNote})` : '',
-    trend !== null ? `7-day trend: ${trend > 0 ? '+' : ''}${trend.toFixed(1)} cm ${trendArrow}` : '',
+    julyAvg !== null ? `${deltaNote}` : '',
+    trend !== null ? `7-day trend: ${trendIn > 0 ? '+' : ''}${trendIn.toFixed(1)} in ${trendArrow}` : '',
     ``,
     `Station 02EB015 · Lake Muskoka · Environment Canada${waterTemp ? ' · NOAA MUR SST' : ''}`,
   ].filter(Boolean).join('\n');
@@ -368,7 +368,7 @@ async function main() {
     body: JSON.stringify({
       from: EMAIL_FROM,
       to: EMAIL_TO,
-      subject: `🌊 Bala Bay: ${latest.value.toFixed(2)}m (${deltaSign}${deltaCm?.toFixed(1) ?? '?'}cm vs July)${waterTemp ? ` · ${waterTemp.tempC.toFixed(0)}°C` : ''}`,
+      subject: `🌊 Bala Bay: ${deltaSign}${deltaIn?.toFixed(1) ?? '?'} in vs July avg${waterTemp ? ` · ${waterTemp.tempC.toFixed(0)}°C` : ''}`,
       html: html,
       text: text,
     }),
