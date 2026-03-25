@@ -22,7 +22,6 @@ const EXTRA_STATIONS = [
   { id: '02EB020', name: 'Port Carling', label: 'Lake Rosseau' },
   { id: '02EB004', name: 'Port Sydney', label: 'N. Branch Muskoka R.' },
   { id: '02EB008', name: 'Baysville', label: 'S. Branch Muskoka R.' },
-  { id: '02EC019', name: 'Vankoughnet', label: 'Black River' },
 ];
 
 // Bala Bay coordinates for satellite SST lookup
@@ -125,20 +124,68 @@ async function fetchWaterTemp() {
   }
 }
 
-// ── Fetch latest level for a single station ──
+// ── Fetch latest level for a single station (returns recent daily array) ──
 
-async function fetchLatestLevel(stationId) {
+async function fetchRecentLevels(stationId) {
   try {
     const feats = await fetchAllFeatures(
       (lim, off) => `${API_BASE}/hydrometric-realtime/items?f=json&STATION_NUMBER=${stationId}&limit=${lim}&offset=${off}`,
       20
     );
     const daily = parseRealtimeFeatures(feats);
-    if (daily.length === 0) return null;
-    const latest = daily[daily.length - 1];
-    return { date: latest.date, value: latest.value };
+    return daily.length > 0 ? daily : null;
   } catch (e) {
     console.log(`  Station ${stationId} fetch failed: ${e.message}`);
+    return null;
+  }
+}
+
+// ── Fetch 5-year July average for a station ──
+
+async function fetchJulyAvg(stationId) {
+  let vals = [];
+  for (const yr of JULY_YEARS) {
+    try {
+      const feats = await fetchAllFeatures(
+        (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${stationId}&datetime=${yr}-07-01/${yr}-07-31&limit=${lim}&offset=${off}`,
+        1
+      );
+      const parsed = parseDailyFeatures(feats);
+      for (const d of parsed) vals.push(d.value);
+    } catch (_) {}
+  }
+  return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+}
+
+// ── Fetch low water level in Feb/Mar 2026 for a station ──
+
+async function fetchLowWater2026(stationId) {
+  try {
+    const feats = await fetchAllFeatures(
+      (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${stationId}&datetime=2026-02-01/2026-03-31&limit=${lim}&offset=${off}`,
+      2
+    );
+    let parsed = parseDailyFeatures(feats);
+    // Also check realtime data for dates not covered by daily-mean
+    const rtFeats = await fetchAllFeatures(
+      (lim, off) => `${API_BASE}/hydrometric-realtime/items?f=json&STATION_NUMBER=${stationId}&limit=${lim}&offset=${off}`,
+      20
+    );
+    const rtDaily = parseRealtimeFeatures(rtFeats).filter(d => d.date >= '2026-02-01' && d.date <= '2026-03-31');
+    // Merge: prefer daily-mean, fill gaps with realtime
+    const dmDates = new Set(parsed.map(d => d.date));
+    for (const d of rtDaily) {
+      if (!dmDates.has(d.date)) parsed.push(d);
+    }
+    parsed.sort((a, b) => a.date.localeCompare(b.date));
+    if (parsed.length === 0) return null;
+    let low = parsed[0];
+    for (const d of parsed) {
+      if (d.value < low.value) low = d;
+    }
+    return low;
+  } catch (e) {
+    console.log(`  Station ${stationId} low water fetch failed: ${e.message}`);
     return null;
   }
 }
@@ -253,17 +300,27 @@ async function main() {
     console.log('  Water temperature unavailable');
   }
 
-  // 5. Fetch extra station levels
-  console.log('Fetching extra station levels...');
+  // 5. Fetch extra station data (recent levels, July avg, low water)
+  console.log('Fetching extra station data...');
+
+  // Also compute Bala's low water for Feb/Mar 2026
+  const balaLowWater = await fetchLowWater2026(STATION);
+  if (balaLowWater) console.log(`  Bala low water: ${balaLowWater.date} = ${balaLowWater.value.toFixed(3)}m`);
+
   const extraResults = await Promise.all(
     EXTRA_STATIONS.map(async (st) => {
-      const data = await fetchLatestLevel(st.id);
-      if (data) {
-        console.log(`  ${st.name} (${st.id}): ${data.date} = ${data.value.toFixed(3)}m`);
+      const [recentDays, stJulyAvg, lowWater] = await Promise.all([
+        fetchRecentLevels(st.id),
+        fetchJulyAvg(st.id),
+        fetchLowWater2026(st.id),
+      ]);
+      if (recentDays) {
+        const lat = recentDays[recentDays.length - 1];
+        console.log(`  ${st.name}: level=${lat.value.toFixed(3)}m, julyAvg=${stJulyAvg?.toFixed(3) ?? 'N/A'}, lowWater=${lowWater ? lowWater.date + '=' + lowWater.value.toFixed(3) + 'm' : 'N/A'}`);
       } else {
-        console.log(`  ${st.name} (${st.id}): no data`);
+        console.log(`  ${st.name}: no data`);
       }
-      return { ...st, data };
+      return { ...st, recentDays, julyAvg: stJulyAvg, lowWater };
     })
   );
 
@@ -307,6 +364,76 @@ async function main() {
   const deltaColor = deltaCm > 10 ? '#E07B4C'
     : deltaCm < -10 ? '#2D6A9F'
     : '#5BA88A';
+
+  // Build area water levels table
+  const areaTableHtml = (() => {
+    const td = 'padding:4px 6px;font-size:11px;color:#0B1D33;border-bottom:1px solid #F0EDE8;white-space:nowrap;';
+    const th = 'padding:4px 6px;font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:0.3px;color:#6B6B6B;border-bottom:2px solid #E0DAD2;white-space:nowrap;';
+    const tdr = td + 'text-align:right;';
+    const thr = th + 'text-align:right;';
+
+    function fmtDate(d) {
+      if (!d) return '\u2014';
+      const dt = new Date(d + 'T12:00:00');
+      return dt.toLocaleDateString('en-CA', { month: 'short', day: 'numeric' });
+    }
+
+    function buildRow(name, label, days, stJulyAvg, lowWater, isBala) {
+      if (!days || days.length === 0) return '';
+      const lat = days[days.length - 1];
+      const level = lat.value;
+
+      const lowDate = lowWater ? fmtDate(lowWater.date) : '\u2014';
+      const aboveLow = lowWater ? ((level - lowWater.value) * 100 / 2.54) : null;
+      const aboveLowStr = aboveLow !== null ? (aboveLow >= 0 ? '+' : '') + aboveLow.toFixed(1) : '\u2014';
+
+      const belowSummer = stJulyAvg !== null ? ((level - stJulyAvg) * 100 / 2.54) : null;
+      const belowSummerStr = belowSummer !== null ? (belowSummer >= 0 ? '+' : '') + belowSummer.toFixed(1) : '\u2014';
+
+      function dayChange(n) {
+        if (days.length <= n) return '\u2014';
+        const prev = days[days.length - 1 - n];
+        const chg = (level - prev.value) * 100 / 2.54;
+        return (chg >= 0 ? '+' : '') + chg.toFixed(1);
+      }
+
+      const bold = isBala ? 'font-weight:600;' : '';
+      return '<tr>'
+        + '<td style="' + td + bold + '">' + name + '</td>'
+        + '<td style="' + td + 'font-size:10px;color:#6B6B6B;">' + label + '</td>'
+        + '<td style="' + tdr + bold + '">' + level.toFixed(3) + '</td>'
+        + '<td style="' + tdr + '">' + lowDate + '</td>'
+        + '<td style="' + tdr + '">' + aboveLowStr + '</td>'
+        + '<td style="' + tdr + '">' + belowSummerStr + '</td>'
+        + '<td style="' + tdr + '">' + dayChange(1) + '</td>'
+        + '<td style="' + tdr + '">' + dayChange(2) + '</td>'
+        + '<td style="' + tdr + '">' + dayChange(3) + '</td>'
+        + '</tr>';
+    }
+
+    const balaRow = buildRow('Bala', 'Lake Muskoka', recentData, julyAvg, balaLowWater, true);
+    const extraRows = extraResults.filter(s => s.recentDays).map(s =>
+      buildRow(s.name, s.label, s.recentDays, s.julyAvg, s.lowWater, false)
+    ).join('');
+
+    return '<div style="margin-bottom:16px;overflow-x:auto;">'
+      + '<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:8px;">Area Water Levels</div>'
+      + '<table style="width:100%;border-collapse:collapse;">'
+      + '<tr>'
+      + '<th style="' + th + '">Station</th>'
+      + '<th style="' + th + '">Water</th>'
+      + '<th style="' + thr + '">Level (m)</th>'
+      + '<th style="' + thr + '">Low Date</th>'
+      + '<th style="' + thr + '">\u2191 Low (in)</th>'
+      + '<th style="' + thr + '">\u2193 Summer (in)</th>'
+      + '<th style="' + thr + '">1d</th>'
+      + '<th style="' + thr + '">2d</th>'
+      + '<th style="' + thr + '">3d</th>'
+      + '</tr>'
+      + balaRow
+      + extraRows
+      + '</table></div>';
+  })();
 
   const html = `
 <!DOCTYPE html>
@@ -355,29 +482,7 @@ async function main() {
       ` : ''}
 
       <!-- Area Water Levels -->
-      ${(() => {
-        const stationsWithData = extraResults.filter(s => s.data);
-        if (stationsWithData.length === 0) return '';
-        const rows = stationsWithData.map(s =>
-          `<tr>
-            <td style="padding:6px 8px;font-size:13px;color:#0B1D33;border-bottom:1px solid #F0EDE8;">${s.name}</td>
-            <td style="padding:6px 8px;font-size:11px;color:#6B6B6B;border-bottom:1px solid #F0EDE8;">${s.label}</td>
-            <td style="padding:6px 8px;font-size:13px;font-weight:600;color:#0B1D33;text-align:right;border-bottom:1px solid #F0EDE8;">${s.data.value.toFixed(3)} m</td>
-          </tr>`
-        ).join('');
-        return `
-        <div style="margin-bottom:16px;">
-          <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:8px;">Area Water Levels</div>
-          <table style="width:100%;border-collapse:collapse;">
-            <tr>
-              <td style="padding:6px 8px;font-size:13px;font-weight:600;color:#0B1D33;border-bottom:1px solid #F0EDE8;">Bala</td>
-              <td style="padding:6px 8px;font-size:11px;color:#6B6B6B;border-bottom:1px solid #F0EDE8;">Lake Muskoka</td>
-              <td style="padding:6px 8px;font-size:13px;font-weight:600;color:#0B1D33;text-align:right;border-bottom:1px solid #F0EDE8;">${latest.value.toFixed(3)} m</td>
-            </tr>
-            ${rows}
-          </table>
-        </div>`;
-      })()}
+      ${areaTableHtml}
 
       <!-- Water Level Chart -->
       <div style="margin-top:12px;">
@@ -413,9 +518,17 @@ async function main() {
 </html>`;
 
   // Plain text fallback
-  const extraText = extraResults.filter(s => s.data).map(s =>
-    `  ${s.name} (${s.label}): ${s.data.value.toFixed(3)} m`
-  ).join('\n');
+  function txtRow(name, label, recentDays, stJulyAvg, lowWater) {
+    if (!recentDays || recentDays.length === 0) return null;
+    const lat = recentDays[recentDays.length - 1];
+    const aboveLow = lowWater ? ((lat.value - lowWater.value) * 100 / 2.54).toFixed(1) : '?';
+    const belowSum = stJulyAvg !== null ? ((lat.value - stJulyAvg) * 100 / 2.54).toFixed(1) : '?';
+    return `  ${name} (${label}): ${lat.value.toFixed(3)}m | ↑low:${aboveLow}in | ↓summer:${belowSum}in`;
+  }
+  const balaText = txtRow('Bala', 'Lake Muskoka', recentData, julyAvg, balaLowWater);
+  const extraText = extraResults.filter(s => s.recentDays).map(s =>
+    txtRow(s.name, s.label, s.recentDays, s.julyAvg, s.lowWater)
+  ).filter(Boolean).join('\n');
   const text = [
     `🌊 Bala Bay Water Level — ${dateStr}`,
     ``,
@@ -424,7 +537,9 @@ async function main() {
     julyAvg !== null ? `${deltaNote}` : '',
     trend !== null ? `7-day trend: ${trendIn > 0 ? '+' : ''}${trendIn.toFixed(1)} in ${trendArrow}` : '',
     ``,
-    extraText ? `Area Water Levels:\n  Bala (Lake Muskoka): ${latest.value.toFixed(3)} m\n${extraText}` : '',
+    `Area Water Levels:`,
+    balaText,
+    extraText,
     ``,
     `Station 02EB015 · Lake Muskoka · Environment Canada${waterTemp ? ' · NOAA MUR SST' : ''}`,
   ].filter(Boolean).join('\n');
