@@ -16,6 +16,15 @@ const STATION = '02EB015';
 const API_BASE = 'https://api.weather.gc.ca/collections';
 const JULY_YEARS = [2021, 2022, 2023, 2024, 2025];
 
+// Additional stations to show current water levels
+const EXTRA_STATIONS = [
+  { id: '02EB018', name: 'Beaumaris', label: 'Lake Muskoka' },
+  { id: '02EB020', name: 'Port Carling', label: 'Lake Rosseau' },
+  { id: '02EB004', name: 'Port Sydney', label: 'N. Branch Muskoka R.' },
+  { id: '02EB008', name: 'Baysville', label: 'S. Branch Muskoka R.' },
+  { id: '02EC019', name: 'Vankoughnet', label: 'Black River' },
+];
+
 // Bala Bay coordinates for satellite SST lookup
 const BALA_LAT = 45.01;
 const BALA_LON = -79.6;
@@ -112,6 +121,24 @@ async function fetchWaterTemp() {
     return { tempC: Math.round(sst * 10) / 10, date };
   } catch (e) {
     console.log(`  Water temp fetch failed: ${e.message}`);
+    return null;
+  }
+}
+
+// ── Fetch latest level for a single station ──
+
+async function fetchLatestLevel(stationId) {
+  try {
+    const feats = await fetchAllFeatures(
+      (lim, off) => `${API_BASE}/hydrometric-realtime/items?f=json&STATION_NUMBER=${stationId}&limit=${lim}&offset=${off}`,
+      20
+    );
+    const daily = parseRealtimeFeatures(feats);
+    if (daily.length === 0) return null;
+    const latest = daily[daily.length - 1];
+    return { date: latest.date, value: latest.value };
+  } catch (e) {
+    console.log(`  Station ${stationId} fetch failed: ${e.message}`);
     return null;
   }
 }
@@ -226,7 +253,21 @@ async function main() {
     console.log('  Water temperature unavailable');
   }
 
-  // 5. Build and send email
+  // 5. Fetch extra station levels
+  console.log('Fetching extra station levels...');
+  const extraResults = await Promise.all(
+    EXTRA_STATIONS.map(async (st) => {
+      const data = await fetchLatestLevel(st.id);
+      if (data) {
+        console.log(`  ${st.name} (${st.id}): ${data.date} = ${data.value.toFixed(3)}m`);
+      } else {
+        console.log(`  ${st.name} (${st.id}): no data`);
+      }
+      return { ...st, data };
+    })
+  );
+
+  // 6. Build and send email
   console.log('Sending email...');
 
   const dateStr = new Date(latest.date + 'T12:00:00').toLocaleDateString('en-CA', {
@@ -313,6 +354,31 @@ async function main() {
       </div>
       ` : ''}
 
+      <!-- Area Water Levels -->
+      ${(() => {
+        const stationsWithData = extraResults.filter(s => s.data);
+        if (stationsWithData.length === 0) return '';
+        const rows = stationsWithData.map(s =>
+          `<tr>
+            <td style="padding:6px 8px;font-size:13px;color:#0B1D33;border-bottom:1px solid #F0EDE8;">${s.name}</td>
+            <td style="padding:6px 8px;font-size:11px;color:#6B6B6B;border-bottom:1px solid #F0EDE8;">${s.label}</td>
+            <td style="padding:6px 8px;font-size:13px;font-weight:600;color:#0B1D33;text-align:right;border-bottom:1px solid #F0EDE8;">${s.data.value.toFixed(3)} m</td>
+          </tr>`
+        ).join('');
+        return `
+        <div style="margin-bottom:16px;">
+          <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:8px;">Area Water Levels</div>
+          <table style="width:100%;border-collapse:collapse;">
+            <tr>
+              <td style="padding:6px 8px;font-size:13px;font-weight:600;color:#0B1D33;border-bottom:1px solid #F0EDE8;">Bala</td>
+              <td style="padding:6px 8px;font-size:11px;color:#6B6B6B;border-bottom:1px solid #F0EDE8;">Lake Muskoka</td>
+              <td style="padding:6px 8px;font-size:13px;font-weight:600;color:#0B1D33;text-align:right;border-bottom:1px solid #F0EDE8;">${latest.value.toFixed(3)} m</td>
+            </tr>
+            ${rows}
+          </table>
+        </div>`;
+      })()}
+
       <!-- Water Level Chart -->
       <div style="margin-top:12px;">
         <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:8px;">Water Level — Last ${chartDays.length} Days</div>
@@ -347,6 +413,9 @@ async function main() {
 </html>`;
 
   // Plain text fallback
+  const extraText = extraResults.filter(s => s.data).map(s =>
+    `  ${s.name} (${s.label}): ${s.data.value.toFixed(3)} m`
+  ).join('\n');
   const text = [
     `🌊 Bala Bay Water Level — ${dateStr}`,
     ``,
@@ -354,6 +423,8 @@ async function main() {
     waterTemp ? `Water temp: ${waterTemp.tempC.toFixed(1)}°C (${(waterTemp.tempC * 9/5 + 32).toFixed(0)}°F)` : '',
     julyAvg !== null ? `${deltaNote}` : '',
     trend !== null ? `7-day trend: ${trendIn > 0 ? '+' : ''}${trendIn.toFixed(1)} in ${trendArrow}` : '',
+    ``,
+    extraText ? `Area Water Levels:\n  Bala (Lake Muskoka): ${latest.value.toFixed(3)} m\n${extraText}` : '',
     ``,
     `Station 02EB015 · Lake Muskoka · Environment Canada${waterTemp ? ' · NOAA MUR SST' : ''}`,
   ].filter(Boolean).join('\n');
