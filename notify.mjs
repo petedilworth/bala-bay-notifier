@@ -124,26 +124,62 @@ async function fetchWaterTemp() {
   }
 }
 
-// ── Fetch latest level for a single station (returns recent daily array) ──
+// ── Fetch all data for a station: realtime + daily-mean backfill + July avg + low water ──
 
-async function fetchRecentLevels(stationId) {
+async function fetchStationData(stationId) {
+  const result = { recentDays: null, julyAvg: null, lowWater: null };
+
+  // 1. Realtime data (recent ~30 days of sub-daily readings, averaged to daily)
+  let realtimeDaily = [];
   try {
-    const feats = await fetchAllFeatures(
+    const rtFeats = await fetchAllFeatures(
       (lim, off) => `${API_BASE}/hydrometric-realtime/items?f=json&STATION_NUMBER=${stationId}&limit=${lim}&offset=${off}`,
       20
     );
-    const daily = parseRealtimeFeatures(feats);
-    return daily.length > 0 ? daily : null;
+    realtimeDaily = parseRealtimeFeatures(rtFeats);
+    realtimeDaily = filterOutliers(realtimeDaily);
   } catch (e) {
-    console.log(`  Station ${stationId} fetch failed: ${e.message}`);
-    return null;
+    console.log(`    Realtime failed: ${e.message}`);
   }
-}
 
-// ── Fetch 5-year July average for a station ──
+  // 2. Daily-mean data for Feb/Mar 2026 (for low water detection)
+  //    Daily-mean is the authoritative source and covers historical dates that
+  //    realtime no longer has.
+  let dailyMeanFebMar = [];
+  try {
+    const feats = await fetchAllFeatures(
+      (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${stationId}&datetime=2026-02-01/2026-03-31&limit=${lim}&offset=${off}`,
+      2
+    );
+    dailyMeanFebMar = parseDailyFeatures(feats);
+  } catch (e) {
+    console.log(`    Daily-mean Feb/Mar failed: ${e.message}`);
+  }
 
-async function fetchJulyAvg(stationId) {
-  let vals = [];
+  // Combine daily-mean + realtime for Feb/Mar low water search
+  const dmDates = new Set(dailyMeanFebMar.map(d => d.date));
+  const rtFebMar = realtimeDaily.filter(d => d.date >= '2026-02-01' && d.date <= '2026-03-31');
+  const combined = [...dailyMeanFebMar];
+  for (const d of rtFebMar) {
+    if (!dmDates.has(d.date)) combined.push(d);
+  }
+  combined.sort((a, b) => a.date.localeCompare(b.date));
+
+  if (combined.length > 0) {
+    let low = combined[0];
+    for (const d of combined) {
+      if (d.value < low.value) low = d;
+    }
+    result.lowWater = low;
+  }
+
+  // 3. Use realtime daily as recent days (for current level + day changes)
+  if (realtimeDaily.length > 0) {
+    result.recentDays = realtimeDaily;
+  }
+
+  // 4. July averages (5-year)
+  let julyVals = [];
   for (const yr of JULY_YEARS) {
     try {
       const feats = await fetchAllFeatures(
@@ -151,43 +187,14 @@ async function fetchJulyAvg(stationId) {
         1
       );
       const parsed = parseDailyFeatures(feats);
-      for (const d of parsed) vals.push(d.value);
+      for (const d of parsed) julyVals.push(d.value);
     } catch (_) {}
   }
-  return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
-}
-
-// ── Fetch low water level in Feb/Mar 2026 for a station ──
-
-async function fetchLowWater2026(stationId) {
-  try {
-    const feats = await fetchAllFeatures(
-      (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${stationId}&datetime=2026-02-01/2026-03-31&limit=${lim}&offset=${off}`,
-      2
-    );
-    let parsed = parseDailyFeatures(feats);
-    // Also check realtime data for dates not covered by daily-mean
-    const rtFeats = await fetchAllFeatures(
-      (lim, off) => `${API_BASE}/hydrometric-realtime/items?f=json&STATION_NUMBER=${stationId}&limit=${lim}&offset=${off}`,
-      20
-    );
-    const rtDaily = parseRealtimeFeatures(rtFeats).filter(d => d.date >= '2026-02-01' && d.date <= '2026-03-31');
-    // Merge: prefer daily-mean, fill gaps with realtime
-    const dmDates = new Set(parsed.map(d => d.date));
-    for (const d of rtDaily) {
-      if (!dmDates.has(d.date)) parsed.push(d);
-    }
-    parsed.sort((a, b) => a.date.localeCompare(b.date));
-    if (parsed.length === 0) return null;
-    let low = parsed[0];
-    for (const d of parsed) {
-      if (d.value < low.value) low = d;
-    }
-    return low;
-  } catch (e) {
-    console.log(`  Station ${stationId} low water fetch failed: ${e.message}`);
-    return null;
+  if (julyVals.length > 0) {
+    result.julyAvg = julyVals.reduce((a, b) => a + b, 0) / julyVals.length;
   }
+
+  return result;
 }
 
 // ── Main ──
@@ -303,28 +310,68 @@ async function main() {
   // 5. Fetch extra station data (recent levels, July avg, low water)
   console.log('Fetching extra station data...');
 
-  // Also compute Bala's low water for Feb/Mar 2026
-  const balaLowWater = await fetchLowWater2026(STATION);
+  // Bala's low water for Feb/Mar 2026 (reuse existing recentData for realtime portion)
+  let balaLowWater = null;
+  {
+    // Fetch daily-mean for Feb/Mar
+    let dailyMeanFebMar = [];
+    try {
+      const feats = await fetchAllFeatures(
+        (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${STATION}&datetime=2026-02-01/2026-03-31&limit=${lim}&offset=${off}`,
+        2
+      );
+      dailyMeanFebMar = parseDailyFeatures(feats);
+    } catch (_) {}
+    const dmDates = new Set(dailyMeanFebMar.map(d => d.date));
+    const rtFebMar = recentData.filter(d => d.date >= '2026-02-01' && d.date <= '2026-03-31');
+    const combined = [...dailyMeanFebMar];
+    for (const d of rtFebMar) {
+      if (!dmDates.has(d.date)) combined.push(d);
+    }
+    combined.sort((a, b) => a.date.localeCompare(b.date));
+    if (combined.length > 0) {
+      balaLowWater = combined[0];
+      for (const d of combined) {
+        if (d.value < balaLowWater.value) balaLowWater = d;
+      }
+    }
+  }
   if (balaLowWater) console.log(`  Bala low water: ${balaLowWater.date} = ${balaLowWater.value.toFixed(3)}m`);
 
   const extraResults = await Promise.all(
     EXTRA_STATIONS.map(async (st) => {
-      const [recentDays, stJulyAvg, lowWater] = await Promise.all([
-        fetchRecentLevels(st.id),
-        fetchJulyAvg(st.id),
-        fetchLowWater2026(st.id),
-      ]);
-      if (recentDays) {
-        const lat = recentDays[recentDays.length - 1];
-        console.log(`  ${st.name}: level=${lat.value.toFixed(3)}m, julyAvg=${stJulyAvg?.toFixed(3) ?? 'N/A'}, lowWater=${lowWater ? lowWater.date + '=' + lowWater.value.toFixed(3) + 'm' : 'N/A'}`);
+      console.log(`  Fetching ${st.name} (${st.id})...`);
+      const data = await fetchStationData(st.id);
+      if (data.recentDays) {
+        const lat = data.recentDays[data.recentDays.length - 1];
+        console.log(`    level=${lat.value.toFixed(3)}m, julyAvg=${data.julyAvg?.toFixed(3) ?? 'N/A'}, lowWater=${data.lowWater ? data.lowWater.date + '=' + data.lowWater.value.toFixed(3) + 'm' : 'N/A'}`);
       } else {
-        console.log(`  ${st.name}: no data`);
+        console.log(`    no data`);
       }
-      return { ...st, recentDays, julyAvg: stJulyAvg, lowWater };
+      return { ...st, recentDays: data.recentDays, julyAvg: data.julyAvg, lowWater: data.lowWater };
     })
   );
 
-  // 6. Build and send email
+  // 6. Dump diagnostic CSV with all computed values
+  {
+    const csvRows = ['Station,Body of Water,Latest Date,Level (m),July Avg (m),Low Water Date,Low Water Level (m),Above Low (in),Below Summer (in),1d Chg (in),2d Chg (in),3d Chg (in)'];
+    function csvRow(name, label, days, stJulyAvg, lowWater) {
+      if (!days || days.length === 0) return;
+      const lat = days[days.length - 1];
+      const level = lat.value;
+      const aboveLow = lowWater ? ((level - lowWater.value) * 100 / 2.54).toFixed(2) : '';
+      const belowSum = stJulyAvg !== null ? ((level - stJulyAvg) * 100 / 2.54).toFixed(2) : '';
+      const chg = (n) => days.length > n ? (((level - days[days.length - 1 - n].value) * 100 / 2.54).toFixed(2)) : '';
+      csvRows.push([name, label, lat.date, level.toFixed(4), stJulyAvg?.toFixed(4) ?? '', lowWater?.date ?? '', lowWater?.value.toFixed(4) ?? '', aboveLow, belowSum, chg(1), chg(2), chg(3)].join(','));
+    }
+    csvRow('Bala', 'Lake Muskoka', recentData, julyAvg, balaLowWater);
+    for (const s of extraResults) csvRow(s.name, s.label, s.recentDays, s.julyAvg, s.lowWater);
+    console.log('\n── Diagnostic CSV ──');
+    for (const row of csvRows) console.log(row);
+    console.log('── End CSV ──\n');
+  }
+
+  // 7. Build and send email
   console.log('Sending email...');
 
   const dateStr = new Date(latest.date + 'T12:00:00').toLocaleDateString('en-CA', {
