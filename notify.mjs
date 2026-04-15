@@ -378,34 +378,66 @@ async function main() {
     weekday: 'long', month: 'long', day: 'numeric', year: 'numeric'
   });
 
-  // Chart: last 60 days as a detailed bar chart with labels
-  const chartDays = recentData.slice(-60);
-  const minVal = Math.min(...chartDays.map(d => d.value));
-  const maxVal = Math.max(...chartDays.map(d => d.value));
-  const range = maxVal - minVal || 0.01;
-  const chartHeight = 120; // px
+  // Water level chart builder: 60-day bar chart with July-avg reference line.
+  // Returns an HTML fragment; when isFirst is false a top border separates it from the chart above.
+  function buildWaterLevelChart(name, label, days, stJulyAvg, isFirst) {
+    if (!days || days.length === 0) return '';
+    const chartDays = days.slice(-60);
+    const minVal = Math.min(...chartDays.map(d => d.value));
+    const maxVal = Math.max(...chartDays.map(d => d.value));
+    const range = maxVal - minVal || 0.01;
+    const chartHeight = 120; // px
 
-  const chartBars = chartDays.map((d, i) => {
-    const pct = (d.value - minVal) / range;
-    const height = Math.max(3, Math.round(pct * (chartHeight - 10) + 3));
-    // Highlight the most recent day
-    const color = i === chartDays.length - 1 ? '#E07B4C' : '#4A9BD9';
-    return `<td style="vertical-align:bottom;padding:0 0.5px;">
-      <div style="width:6px;height:${height}px;background:${color};border-radius:1px;" title="${d.date}: ${d.value.toFixed(3)}m"></div>
-    </td>`;
-  }).join('');
+    const bars = chartDays.map((d, i) => {
+      const pct = (d.value - minVal) / range;
+      const height = Math.max(3, Math.round(pct * (chartHeight - 10) + 3));
+      const color = i === chartDays.length - 1 ? '#E07B4C' : '#4A9BD9';
+      return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:6px;height:${height}px;background:${color};border-radius:1px;" title="${d.date}: ${d.value.toFixed(3)}m"></div></td>`;
+    }).join('');
 
-  // Date labels: first, middle, and last
-  const firstDate = chartDays[0];
-  const midIdx = Math.floor(chartDays.length / 2);
-  const midDate = chartDays[midIdx];
-  const lastDate = chartDays[chartDays.length - 1];
-  const fmtShort = (d) => { const dt = new Date(d.date + 'T12:00:00'); return dt.toLocaleDateString('en-CA', { month: 'short', day: 'numeric' }); };
+    const fmtShort = (d) => new Date(d.date + 'T12:00:00').toLocaleDateString('en-CA', { month: 'short', day: 'numeric' });
+    const firstDate = chartDays[0];
+    const midDate = chartDays[Math.floor(chartDays.length / 2)];
+    const lastDate = chartDays[chartDays.length - 1];
 
-  // July average reference line position (if available)
-  let refLinePct = null;
-  if (julyAvg !== null && julyAvg >= minVal && julyAvg <= maxVal) {
-    refLinePct = ((julyAvg - minVal) / range) * 100;
+    let refLinePct = null;
+    if (stJulyAvg !== null && stJulyAvg >= minVal && stJulyAvg <= maxVal) {
+      refLinePct = ((stJulyAvg - minVal) / range) * 100;
+    }
+
+    const latest = chartDays[chartDays.length - 1];
+    const vsJulyStr = stJulyAvg !== null
+      ? (() => {
+          const diffIn = (latest.value - stJulyAvg) * 100 / 2.54;
+          return ` · ${diffIn >= 0 ? '+' : ''}${diffIn.toFixed(1)}in vs Jul avg`;
+        })()
+      : '';
+
+    const sectionStyle = isFirst
+      ? 'margin-top:12px;'
+      : 'margin-top:20px;border-top:1px solid #E0DAD2;padding-top:16px;';
+
+    return `
+      <div style="${sectionStyle}">
+        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:2px;">${name} — ${label}</div>
+        <div style="font-size:9px;color:#999;margin-bottom:8px;">Water Level — Last ${chartDays.length} Days${vsJulyStr}</div>
+        <div style="position:relative;">
+          <div style="display:inline-block;vertical-align:bottom;position:relative;border-bottom:1px solid #E0DAD2;padding-left:2px;">
+            ${refLinePct !== null ? `<div style="position:absolute;left:0;right:0;bottom:${refLinePct}%;border-top:1px dashed #5BA88A;z-index:1;"><span style="position:absolute;right:0;top:-10px;font-size:8px;color:#5BA88A;">Jul avg</span></div>` : ''}
+            <table style="border-collapse:collapse;height:${chartHeight}px;"><tr>${bars}</tr></table>
+          </div>
+        </div>
+        <div style="font-size:9px;color:#999;display:flex;justify-content:space-between;margin-top:2px;">
+          <span>${fmtShort(firstDate)}</span>
+          <span>${fmtShort(midDate)}</span>
+          <span style="font-weight:600;color:#6B6B6B;">${fmtShort(lastDate)}</span>
+        </div>
+        <div style="margin-top:6px;font-size:9px;color:#999;">
+          <span style="display:inline-block;width:8px;height:8px;background:#4A9BD9;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Daily level
+          <span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Today
+          ${refLinePct !== null ? '<span style="display:inline-block;width:12px;border-top:1px dashed #5BA88A;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Jul avg' : ''}
+        </div>
+      </div>`;
   }
 
   const deltaColor = deltaCm > 10 ? '#E07B4C'
@@ -531,28 +563,12 @@ async function main() {
       <!-- Area Water Levels -->
       ${areaTableHtml}
 
-      <!-- Water Level Chart -->
-      <div style="margin-top:12px;">
-        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:8px;">Water Level — Last ${chartDays.length} Days</div>
-        <div style="position:relative;">
-          <!-- Bars -->
-          <div style="display:inline-block;vertical-align:bottom;position:relative;border-bottom:1px solid #E0DAD2;padding-left:2px;">
-            ${refLinePct !== null ? `<div style="position:absolute;left:0;right:0;bottom:${refLinePct}%;border-top:1px dashed #5BA88A;z-index:1;"><span style="position:absolute;right:0;top:-10px;font-size:8px;color:#5BA88A;">Jul avg</span></div>` : ''}
-            <table style="border-collapse:collapse;height:${chartHeight}px;"><tr>${chartBars}</tr></table>
-          </div>
-        </div>
-        <!-- Date labels -->
-        <div style="font-size:9px;color:#999;display:flex;justify-content:space-between;margin-top:2px;">
-          <span>${fmtShort(firstDate)}</span>
-          <span>${fmtShort(midDate)}</span>
-          <span style="font-weight:600;color:#6B6B6B;">${fmtShort(lastDate)}</span>
-        </div>
-        <div style="margin-top:6px;font-size:9px;color:#999;">
-          <span style="display:inline-block;width:8px;height:8px;background:#4A9BD9;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Daily level
-          <span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Today
-          ${refLinePct !== null ? '<span style="display:inline-block;width:12px;border-top:1px dashed #5BA88A;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Jul avg' : ''}
-        </div>
-      </div>
+      <!-- Water Level Charts: Bala + extra stations -->
+      ${buildWaterLevelChart('Bala', 'Lake Muskoka', recentData, julyAvg, true)}
+      ${extraResults
+        .filter(s => s.recentDays && s.recentDays.length > 0)
+        .map(s => buildWaterLevelChart(s.name, s.label, s.recentDays, s.julyAvg, false))
+        .join('')}
     </div>
 
     <!-- Footer -->
