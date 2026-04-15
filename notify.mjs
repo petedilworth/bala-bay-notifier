@@ -16,6 +16,12 @@ const STATION = '02EB015';
 const API_BASE = 'https://api.weather.gc.ca/collections';
 const JULY_YEARS = [2021, 2022, 2023, 2024, 2025];
 
+// Low-water search window: from Feb 1 of the current year through today.
+// Captures the annual winter/spring low as the year progresses.
+const TODAY_ISO = new Date().toISOString().substring(0, 10);
+const LOW_WATER_START = `${TODAY_ISO.substring(0, 4)}-02-01`;
+const LOW_WATER_END = TODAY_ISO;
+
 // Additional stations to show current water levels
 const EXTRA_STATIONS = [
   { id: '02EB018', name: 'Beaumaris', label: 'Lake Muskoka' },
@@ -142,25 +148,25 @@ async function fetchStationData(stationId) {
     console.log(`    Realtime failed: ${e.message}`);
   }
 
-  // 2. Daily-mean data for Feb/Mar 2026 (for low water detection)
+  // 2. Daily-mean data for low-water window (Feb 1 → today) for low water detection.
   //    Daily-mean is the authoritative source and covers historical dates that
   //    realtime no longer has.
-  let dailyMeanFebMar = [];
+  let dailyMeanLow = [];
   try {
     const feats = await fetchAllFeatures(
-      (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${stationId}&datetime=2026-02-01/2026-03-31&limit=${lim}&offset=${off}`,
-      2
+      (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${stationId}&datetime=${LOW_WATER_START}/${LOW_WATER_END}&limit=${lim}&offset=${off}`,
+      4
     );
-    dailyMeanFebMar = parseDailyFeatures(feats);
+    dailyMeanLow = parseDailyFeatures(feats);
   } catch (e) {
-    console.log(`    Daily-mean Feb/Mar failed: ${e.message}`);
+    console.log(`    Daily-mean low-window failed: ${e.message}`);
   }
 
-  // Combine daily-mean + realtime for Feb/Mar low water search
-  const dmDates = new Set(dailyMeanFebMar.map(d => d.date));
-  const rtFebMar = realtimeDaily.filter(d => d.date >= '2026-02-01' && d.date <= '2026-03-31');
-  const combined = [...dailyMeanFebMar];
-  for (const d of rtFebMar) {
+  // Combine daily-mean + realtime for low water search over the full window.
+  const dmDates = new Set(dailyMeanLow.map(d => d.date));
+  const rtLow = realtimeDaily.filter(d => d.date >= LOW_WATER_START && d.date <= LOW_WATER_END);
+  const combined = [...dailyMeanLow];
+  for (const d of rtLow) {
     if (!dmDates.has(d.date)) combined.push(d);
   }
   combined.sort((a, b) => a.date.localeCompare(b.date));
@@ -310,22 +316,21 @@ async function main() {
   // 5. Fetch extra station data (recent levels, July avg, low water)
   console.log('Fetching extra station data...');
 
-  // Bala's low water for Feb/Mar 2026 (reuse existing recentData for realtime portion)
+  // Bala's low water for the current-year low-water window (Feb 1 → today).
   let balaLowWater = null;
   {
-    // Fetch daily-mean for Feb/Mar
-    let dailyMeanFebMar = [];
+    let dailyMeanLow = [];
     try {
       const feats = await fetchAllFeatures(
-        (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${STATION}&datetime=2026-02-01/2026-03-31&limit=${lim}&offset=${off}`,
-        2
+        (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${STATION}&datetime=${LOW_WATER_START}/${LOW_WATER_END}&limit=${lim}&offset=${off}`,
+        4
       );
-      dailyMeanFebMar = parseDailyFeatures(feats);
+      dailyMeanLow = parseDailyFeatures(feats);
     } catch (_) {}
-    const dmDates = new Set(dailyMeanFebMar.map(d => d.date));
-    const rtFebMar = recentData.filter(d => d.date >= '2026-02-01' && d.date <= '2026-03-31');
-    const combined = [...dailyMeanFebMar];
-    for (const d of rtFebMar) {
+    const dmDates = new Set(dailyMeanLow.map(d => d.date));
+    const rtLow = recentData.filter(d => d.date >= LOW_WATER_START && d.date <= LOW_WATER_END);
+    const combined = [...dailyMeanLow];
+    for (const d of rtLow) {
       if (!dmDates.has(d.date)) combined.push(d);
     }
     combined.sort((a, b) => a.date.localeCompare(b.date));
@@ -480,7 +485,6 @@ async function main() {
       return '<tr>'
         + '<td style="' + td + bold + '">' + name + '</td>'
         + '<td style="' + td + 'font-size:10px;color:#6B6B6B;">' + label + '</td>'
-        + '<td style="' + tdr + bold + '">' + level.toFixed(3) + '</td>'
         + '<td style="' + tdr + '">' + lowDate + '</td>'
         + '<td style="' + tdr + '">' + aboveLowStr + '</td>'
         + '<td style="' + tdr + '">' + belowSummerStr + '</td>'
@@ -501,7 +505,6 @@ async function main() {
       + '<tr>'
       + '<th style="' + th + '">Station</th>'
       + '<th style="' + th + '">Water</th>'
-      + '<th style="' + thr + '">Level (m)</th>'
       + '<th style="' + thr + '">Low Date</th>'
       + '<th style="' + thr + '">\u2191 Low (in)</th>'
       + '<th style="' + thr + '">\u2193 Summer (in)</th>'
@@ -607,6 +610,26 @@ async function main() {
     `Station 02EB015 · Lake Muskoka · Environment Canada${waterTemp ? ' · NOAA MUR SST' : ''}`,
   ].filter(Boolean).join('\n');
 
+  // Build CSV attachment: per-day water level for all 5 stations.
+  // Note: level_m is the raw LEVEL as reported by MSC — some stations report
+  // absolute elevation (e.g. Bala) while others report gauge height from a
+  // local datum, so values are NOT directly comparable across stations.
+  const csvLines = ['date,station_number,station_name,water_body,level_m'];
+  for (const d of recentData) {
+    csvLines.push([d.date, STATION, 'Bala', 'Lake Muskoka', d.value.toFixed(4)].join(','));
+  }
+  for (const s of extraResults) {
+    if (!s.recentDays) continue;
+    for (const d of s.recentDays) {
+      csvLines.push([d.date, s.id, s.name, s.label, d.value.toFixed(4)].join(','));
+    }
+  }
+  const csvContent = csvLines.join('\n') + '\n';
+  const csvAttachment = {
+    filename: `water-levels-${latest.date}.csv`,
+    content: Buffer.from(csvContent, 'utf8').toString('base64'),
+  };
+
   // Send via Resend
   const emailResp = await fetch('https://api.resend.com/emails', {
     method: 'POST',
@@ -620,6 +643,7 @@ async function main() {
       subject: `🌊 Bala Bay: ${deltaSign}${deltaIn?.toFixed(1) ?? '?'} in vs July avg${waterTemp ? ` · ${waterTemp.tempC.toFixed(0)}°C` : ''}`,
       html: html,
       text: text,
+      attachments: [csvAttachment],
     }),
   });
 
