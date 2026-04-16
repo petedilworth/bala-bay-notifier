@@ -34,6 +34,15 @@ const EXTRA_STATIONS = [
   { id: '02EB008', name: 'Baysville', label: 'S. Branch Muskoka R.' },
 ];
 
+// Flow rate stations (discharge in m³/s) — WSC gauges on the rivers
+const FLOW_STATIONS = [
+  { id: '02EB006', name: 'Bala', label: 'Muskoka River' },
+  { id: '02EB013', name: 'Bracebridge', label: 'Muskoka River' },
+  { id: '02EB004', name: 'Port Sydney', label: 'N. Branch Muskoka R.' },
+  { id: '02EB008', name: 'Baysville', label: 'S. Branch Muskoka R.' },
+  { id: '02EB011', name: 'Port Carling', label: 'Indian River' },
+];
+
 // Bala Bay coordinates for satellite SST lookup
 const BALA_LAT = 45.01;
 const BALA_LON = -79.6;
@@ -89,6 +98,32 @@ function parseDailyFeatures(features) {
     if (p.LEVEL == null) continue;
     const date = (p.DATE || '').substring(0, 10);
     if (date) results.push({ date, value: p.LEVEL });
+  }
+  return results.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function parseRealtimeDischarge(features) {
+  const dayMap = {};
+  for (const f of features) {
+    const p = f.properties || {};
+    if (p.DISCHARGE == null) continue;
+    const d = (p.DATETIME || '').substring(0, 10);
+    if (!d) continue;
+    if (!dayMap[d]) dayMap[d] = [];
+    dayMap[d].push(p.DISCHARGE);
+  }
+  return Object.entries(dayMap)
+    .map(([date, v]) => ({ date, value: v.reduce((a, b) => a + b, 0) / v.length }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function parseDailyDischarge(features) {
+  const results = [];
+  for (const f of features) {
+    const p = f.properties || {};
+    if (p.DISCHARGE == null) continue;
+    const date = (p.DATE || '').substring(0, 10);
+    if (date) results.push({ date, value: p.DISCHARGE });
   }
   return results.sort((a, b) => a.date.localeCompare(b.date));
 }
@@ -195,6 +230,46 @@ async function fetchStationData(stationId) {
   return result;
 }
 
+// ── Fetch discharge (flow) data for a station ──
+
+async function fetchFlowData(stationId) {
+  const result = { realtimeDaily: [], history: [], recentDays: null };
+
+  // Realtime discharge (recent ~30 days of sub-daily readings, averaged to daily)
+  try {
+    const rtFeats = await fetchAllFeatures(
+      (lim, off) => `${API_BASE}/hydrometric-realtime/items?f=json&STATION_NUMBER=${stationId}&limit=${lim}&offset=${off}`,
+      20
+    );
+    result.realtimeDaily = filterOutliers(parseRealtimeDischarge(rtFeats));
+  } catch (e) {
+    console.log(`    Realtime flow failed: ${e.message}`);
+  }
+
+  // Daily-mean discharge history (backfill for the chart)
+  const flowStart = (() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 90);
+    return d.toISOString().substring(0, 10);
+  })();
+  try {
+    const feats = await fetchAllFeatures(
+      (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${stationId}&datetime=${flowStart}/${TODAY_ISO}&limit=${lim}&offset=${off}`,
+      5
+    );
+    result.history = parseDailyDischarge(feats);
+  } catch (e) {
+    console.log(`    Daily-mean flow failed: ${e.message}`);
+  }
+
+  // Combine: history + realtime fill for dates history hasn't published yet
+  const histDates = new Set(result.history.map(d => d.date));
+  const rtFill = result.realtimeDaily.filter(d => !histDates.has(d.date));
+  result.recentDays = [...result.history, ...rtFill].sort((a, b) => a.date.localeCompare(b.date));
+
+  return result;
+}
+
 // ── Main ──
 
 async function main() {
@@ -287,7 +362,24 @@ async function main() {
     })
   );
 
-  // 6. Dump diagnostic CSV with all computed values
+  // 7. Fetch flow rate data for river stations (parallel).
+  console.log('Fetching flow rate data...');
+
+  const flowResults = await Promise.all(
+    FLOW_STATIONS.map(async (st) => {
+      console.log(`  Fetching flow ${st.name} (${st.id})...`);
+      const data = await fetchFlowData(st.id);
+      if (data.recentDays && data.recentDays.length > 0) {
+        const lat = data.recentDays[data.recentDays.length - 1];
+        console.log(`    flow=${lat.value.toFixed(1)} m³/s (${data.recentDays.length} days)`);
+      } else {
+        console.log(`    no discharge data`);
+      }
+      return { ...st, recentDays: data.recentDays };
+    })
+  );
+
+  // 8. Dump diagnostic CSV with all computed values
   {
     const csvRows = ['Station,Body of Water,Latest Date,Level (m),July Avg (m),Low Water Date,Low Water Level (m),Above Low (in),Below Summer (in),1d Chg (in),2d Chg (in),3d Chg (in)'];
     function csvRow(name, label, days, stJulyAvg, lowWater) {
@@ -372,6 +464,54 @@ async function main() {
           <span style="display:inline-block;width:8px;height:8px;background:#4A9BD9;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Daily level
           <span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Today
           ${refLinePx !== null ? '<span style="display:inline-block;width:12px;border-top:1px dashed #5BA88A;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Jul avg' : ''}
+        </div>
+      </div>`;
+  }
+
+  // Flow rate chart builder: 60-day bar chart for discharge (m³/s).
+  function buildFlowChart(name, label, days, isFirst) {
+    if (!days || days.length === 0) return '';
+    const chartDays = days.slice(-60);
+    const minVal = Math.min(...chartDays.map(d => d.value));
+    const maxVal = Math.max(...chartDays.map(d => d.value));
+    const range = maxVal - minVal || 0.01;
+    const chartHeight = 120; // px
+
+    const bars = chartDays.map((d, i) => {
+      const pct = (d.value - minVal) / range;
+      const height = Math.max(3, Math.round(pct * (chartHeight - 10) + 3));
+      const color = i === chartDays.length - 1 ? '#E07B4C' : '#6B8EAD';
+      return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:6px;height:${height}px;background:${color};border-radius:1px;" title="${d.date}: ${d.value.toFixed(1)} m³/s"></div></td>`;
+    }).join('');
+
+    const fmtShort = (d) => new Date(d.date + 'T12:00:00').toLocaleDateString('en-CA', { month: 'short', day: 'numeric' });
+    const firstDate = chartDays[0];
+    const midDate = chartDays[Math.floor(chartDays.length / 2)];
+    const lastDate = chartDays[chartDays.length - 1];
+
+    const latest = chartDays[chartDays.length - 1];
+
+    const sectionStyle = isFirst
+      ? 'margin-top:12px;'
+      : 'margin-top:20px;border-top:1px solid #E0DAD2;padding-top:16px;';
+
+    return `
+      <div style="${sectionStyle}">
+        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:2px;">${name} — ${label}</div>
+        <div style="font-size:9px;color:#999;margin-bottom:8px;">Flow Rate — Last ${chartDays.length} Days · ${latest.value.toFixed(1)} m³/s</div>
+        <div style="position:relative;">
+          <div style="display:inline-block;vertical-align:bottom;position:relative;border-bottom:1px solid #E0DAD2;padding-left:2px;">
+            <table style="border-collapse:collapse;height:${chartHeight}px;"><tr>${bars}</tr></table>
+          </div>
+        </div>
+        <div style="font-size:9px;color:#999;display:flex;justify-content:space-between;margin-top:2px;">
+          <span>${fmtShort(firstDate)}</span>
+          <span>${fmtShort(midDate)}</span>
+          <span style="font-weight:600;color:#6B6B6B;">${fmtShort(lastDate)}</span>
+        </div>
+        <div style="margin-top:6px;font-size:9px;color:#999;">
+          <span style="display:inline-block;width:8px;height:8px;background:#6B8EAD;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Daily flow
+          <span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Today
         </div>
       </div>`;
   }
@@ -503,6 +643,17 @@ async function main() {
         .filter(s => s.recentDays && s.recentDays.length > 0)
         .map(s => buildWaterLevelChart(s.name, s.label, s.recentDays, s.julyAvg, false))
         .join('')}
+
+      <!-- Flow Rate Charts -->
+      ${flowResults.filter(s => s.recentDays && s.recentDays.length > 0).length > 0 ? `
+      <div style="margin-top:24px;border-top:2px solid #E0DAD2;padding-top:16px;">
+        <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:4px;">River Flow Rates</div>
+        ${flowResults
+          .filter(s => s.recentDays && s.recentDays.length > 0)
+          .map((s, i) => buildFlowChart(s.name, s.label, s.recentDays, i === 0))
+          .join('')}
+      </div>
+      ` : ''}
     </div>
 
     <!-- Footer -->
@@ -526,6 +677,12 @@ async function main() {
   const extraText = extraResults.filter(s => s.recentDays).map(s =>
     txtRow(s.name, s.label, s.recentDays, s.julyAvg, s.lowWater)
   ).filter(Boolean).join('\n');
+  const flowText = flowResults
+    .filter(s => s.recentDays && s.recentDays.length > 0)
+    .map(s => {
+      const lat = s.recentDays[s.recentDays.length - 1];
+      return `  ${s.name} (${s.label}): ${lat.value.toFixed(1)} m³/s`;
+    }).join('\n');
   const text = [
     `🌊 Bala Bay Water Level — ${dateStr}`,
     ``,
@@ -537,6 +694,7 @@ async function main() {
     `Area Water Levels:`,
     balaText,
     extraText,
+    flowText ? `\nRiver Flow Rates:\n${flowText}` : '',
     ``,
     `Station 02EB015 · Lake Muskoka · Environment Canada${waterTemp ? ' · NOAA MUR SST' : ''}`,
   ].filter(Boolean).join('\n');
