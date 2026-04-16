@@ -241,22 +241,22 @@ async function fetchFlowData(stationId) {
       (lim, off) => `${API_BASE}/hydrometric-realtime/items?f=json&STATION_NUMBER=${stationId}&limit=${lim}&offset=${off}`,
       20
     );
+    const withDischarge = rtFeats.filter(f => f.properties?.DISCHARGE != null).length;
+    console.log(`    realtime: ${rtFeats.length} features, ${withDischarge} with DISCHARGE`);
     result.realtimeDaily = parseRealtimeDischarge(rtFeats);
   } catch (e) {
     console.log(`    Realtime flow failed: ${e.message}`);
   }
 
-  // Daily-mean discharge history (backfill for the chart)
-  const flowStart = (() => {
-    const d = new Date();
-    d.setDate(d.getDate() - 90);
-    return d.toISOString().substring(0, 10);
-  })();
+  // Daily-mean discharge history — use full history window (same as water levels)
+  // so we catch data even if the discharge rating curve lags months behind.
   try {
     const feats = await fetchAllFeatures(
-      (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${stationId}&datetime=${flowStart}/${TODAY_ISO}&limit=${lim}&offset=${off}`,
-      5
+      (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${stationId}&datetime=${HISTORY_START}/${TODAY_ISO}&limit=${lim}&offset=${off}`,
+      20
     );
+    const withDischarge = feats.filter(f => f.properties?.DISCHARGE != null).length;
+    console.log(`    daily-mean: ${feats.length} features, ${withDischarge} with DISCHARGE`);
     result.history = parseDailyDischarge(feats);
   } catch (e) {
     console.log(`    Daily-mean flow failed: ${e.message}`);
