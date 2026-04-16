@@ -335,9 +335,10 @@ async function main() {
     const midDate = chartDays[Math.floor(chartDays.length / 2)];
     const lastDate = chartDays[chartDays.length - 1];
 
-    let refLinePct = null;
+    let refLinePx = null;
     if (stJulyAvg !== null && stJulyAvg >= minVal && stJulyAvg <= maxVal) {
-      refLinePct = ((stJulyAvg - minVal) / range) * 100;
+      const refPct = (stJulyAvg - minVal) / range;
+      refLinePx = Math.round(refPct * (chartHeight - 10) + 3);
     }
 
     const latest = chartDays[chartDays.length - 1];
@@ -358,7 +359,7 @@ async function main() {
         <div style="font-size:9px;color:#999;margin-bottom:8px;">Water Level — Last ${chartDays.length} Days${vsJulyStr}</div>
         <div style="position:relative;">
           <div style="display:inline-block;vertical-align:bottom;position:relative;border-bottom:1px solid #E0DAD2;padding-left:2px;">
-            ${refLinePct !== null ? `<div style="position:absolute;left:0;right:0;bottom:${refLinePct}%;border-top:1px dashed #5BA88A;z-index:1;"><span style="position:absolute;right:0;top:-10px;font-size:8px;color:#5BA88A;">Jul avg</span></div>` : ''}
+            ${refLinePx !== null ? `<div style="position:absolute;left:0;right:0;bottom:${refLinePx}px;border-top:1px dashed #5BA88A;z-index:1;"><span style="position:absolute;right:0;top:-10px;font-size:8px;color:#5BA88A;">Jul avg</span></div>` : ''}
             <table style="border-collapse:collapse;height:${chartHeight}px;"><tr>${bars}</tr></table>
           </div>
         </div>
@@ -370,7 +371,7 @@ async function main() {
         <div style="margin-top:6px;font-size:9px;color:#999;">
           <span style="display:inline-block;width:8px;height:8px;background:#4A9BD9;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Daily level
           <span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Today
-          ${refLinePct !== null ? '<span style="display:inline-block;width:12px;border-top:1px dashed #5BA88A;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Jul avg' : ''}
+          ${refLinePx !== null ? '<span style="display:inline-block;width:12px;border-top:1px dashed #5BA88A;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Jul avg' : ''}
         </div>
       </div>`;
   }
