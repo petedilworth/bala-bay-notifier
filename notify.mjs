@@ -241,7 +241,7 @@ async function fetchFlowData(stationId) {
       (lim, off) => `${API_BASE}/hydrometric-realtime/items?f=json&STATION_NUMBER=${stationId}&limit=${lim}&offset=${off}`,
       20
     );
-    result.realtimeDaily = filterOutliers(parseRealtimeDischarge(rtFeats));
+    result.realtimeDaily = parseRealtimeDischarge(rtFeats);
   } catch (e) {
     console.log(`    Realtime flow failed: ${e.message}`);
   }
@@ -449,16 +449,16 @@ async function main() {
       <div style="${sectionStyle}">
         <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:2px;">${name} — ${label}</div>
         <div style="font-size:9px;color:#999;margin-bottom:8px;">Water Level — Last ${chartDays.length} Days${vsJulyStr}</div>
-        <div style="position:relative;">
-          <div style="display:inline-block;vertical-align:bottom;position:relative;border-bottom:1px solid #E0DAD2;padding-left:2px;">
+        <div style="display:inline-block;">
+          <div style="position:relative;border-bottom:1px solid #E0DAD2;padding-left:2px;">
             ${refLinePx !== null ? `<div style="position:absolute;left:0;right:0;bottom:${refLinePx}px;border-top:1px dashed #5BA88A;z-index:1;"><span style="position:absolute;right:0;top:-10px;font-size:8px;color:#5BA88A;">Jul avg</span></div>` : ''}
             <table style="border-collapse:collapse;height:${chartHeight}px;"><tr>${bars}</tr></table>
           </div>
-        </div>
-        <div style="font-size:9px;color:#999;display:flex;justify-content:space-between;margin-top:2px;">
-          <span>${fmtShort(firstDate)}</span>
-          <span>${fmtShort(midDate)}</span>
-          <span style="font-weight:600;color:#6B6B6B;">${fmtShort(lastDate)}</span>
+          <table style="width:100%;border-collapse:collapse;margin-top:2px;"><tr>
+            <td style="font-size:9px;color:#999;text-align:left;padding:0;">${fmtShort(firstDate)}</td>
+            <td style="font-size:9px;color:#999;text-align:center;padding:0;">${fmtShort(midDate)}</td>
+            <td style="font-size:9px;color:#6B6B6B;text-align:right;font-weight:600;padding:0;">${fmtShort(lastDate)}</td>
+          </tr></table>
         </div>
         <div style="margin-top:6px;font-size:9px;color:#999;">
           <span style="display:inline-block;width:8px;height:8px;background:#4A9BD9;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Daily level
@@ -499,15 +499,15 @@ async function main() {
       <div style="${sectionStyle}">
         <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:2px;">${name} — ${label}</div>
         <div style="font-size:9px;color:#999;margin-bottom:8px;">Flow Rate — Last ${chartDays.length} Days · ${latest.value.toFixed(1)} m³/s</div>
-        <div style="position:relative;">
-          <div style="display:inline-block;vertical-align:bottom;position:relative;border-bottom:1px solid #E0DAD2;padding-left:2px;">
+        <div style="display:inline-block;">
+          <div style="position:relative;border-bottom:1px solid #E0DAD2;padding-left:2px;">
             <table style="border-collapse:collapse;height:${chartHeight}px;"><tr>${bars}</tr></table>
           </div>
-        </div>
-        <div style="font-size:9px;color:#999;display:flex;justify-content:space-between;margin-top:2px;">
-          <span>${fmtShort(firstDate)}</span>
-          <span>${fmtShort(midDate)}</span>
-          <span style="font-weight:600;color:#6B6B6B;">${fmtShort(lastDate)}</span>
+          <table style="width:100%;border-collapse:collapse;margin-top:2px;"><tr>
+            <td style="font-size:9px;color:#999;text-align:left;padding:0;">${fmtShort(firstDate)}</td>
+            <td style="font-size:9px;color:#999;text-align:center;padding:0;">${fmtShort(midDate)}</td>
+            <td style="font-size:9px;color:#6B6B6B;text-align:right;font-weight:600;padding:0;">${fmtShort(lastDate)}</td>
+          </tr></table>
         </div>
         <div style="margin-top:6px;font-size:9px;color:#999;">
           <span style="display:inline-block;width:8px;height:8px;background:#6B8EAD;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Daily flow
