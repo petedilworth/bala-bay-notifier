@@ -1,0 +1,10 @@
+{
+  "name": "bala-bay-notifier",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "chart.js": "^4.4.0",
+    "chartjs-node-canvas": "^5.0.0"
+  }
+}

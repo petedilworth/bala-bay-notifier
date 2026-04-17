@@ -1,3 +1,5 @@
+import { ChartJSNodeCanvas } from 'chartjs-node-canvas';
+
 /**
  * Bala Bay Daily Water Level Notification
  *
@@ -169,6 +171,166 @@ async function fetchWaterTemp() {
   }
 }
 
+// ── Historical water temperature for spaghetti chart (MUR SST v4.1 starts 2002-06-01) ──
+
+async function fetchHistoricalWaterTemp() {
+  const startDate = '2002-06-01';
+  const url = `${ERDDAP_BASE}/jplMURSST41.csv?analysed_sst[(${startDate}):(${TODAY_ISO})][(${BALA_LAT})][(${BALA_LON})]`;
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const text = await resp.text();
+
+    const lines = text.split('\n');
+    // Line 1: header, Line 2: units, Lines 3+: data
+    const dataLines = lines.slice(2).filter(l => l.trim());
+
+    const records = [];
+    for (const line of dataLines) {
+      const parts = line.split(',');
+      if (parts.length < 4) continue;
+      const dateStr = parts[0].substring(0, 10);
+      const sst = parseFloat(parts[3]);
+      if (isNaN(sst)) continue;
+
+      const year = parseInt(dateStr.substring(0, 4));
+      const dt = new Date(dateStr + 'T00:00:00Z');
+      const jan1 = new Date(Date.UTC(year, 0, 1));
+      const dayOfYear = Math.floor((dt - jan1) / 86400000) + 1;
+
+      records.push({ date: dateStr, year, dayOfYear, tempC: sst });
+    }
+
+    console.log(`  Historical temp: ${records.length} records across ${new Set(records.map(r => r.year)).size} years`);
+    return records;
+  } catch (e) {
+    console.log(`  Historical water temp fetch failed: ${e.message}`);
+    return null;
+  }
+}
+
+// ── Build water temperature spaghetti chart (year-over-year overlay) ──
+
+async function buildTempSpaghettiChart(records) {
+  if (!records || records.length === 0) return null;
+
+  const byYear = {};
+  for (const r of records) {
+    if (!byYear[r.year]) byYear[r.year] = [];
+    byYear[r.year].push(r);
+  }
+
+  const years = Object.keys(byYear).map(Number).sort();
+  const currentYear = CURRENT_YEAR;
+  const prevYear = currentYear - 1;
+
+  const datasets = years.map(year => {
+    const data = byYear[year]
+      .sort((a, b) => a.dayOfYear - b.dayOfYear)
+      .map(r => ({ x: r.dayOfYear, y: r.tempC }));
+
+    let color, width, order;
+    if (year === currentYear) {
+      color = '#2D6A9F';
+      width = 2.5;
+      order = 0;
+    } else if (year === prevYear) {
+      color = '#444444';
+      width = 1.5;
+      order = 1;
+    } else {
+      color = 'rgba(180, 180, 180, 0.4)';
+      width = 1;
+      order = 2;
+    }
+
+    return {
+      label: String(year),
+      data,
+      borderColor: color,
+      borderWidth: width,
+      pointRadius: 0,
+      fill: false,
+      tension: 0.3,
+      spanGaps: false,
+      order,
+    };
+  });
+
+  // Sort so current year renders on top (lowest order = drawn last = on top)
+  datasets.sort((a, b) => b.order - a.order);
+
+  const monthStarts = [1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335];
+  const monthLabels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+  const chartWidth = 560;
+  const chartHeight = 280;
+
+  const chartJSNodeCanvas = new ChartJSNodeCanvas({
+    width: chartWidth,
+    height: chartHeight,
+    backgroundColour: '#FFFFFF',
+  });
+
+  const config = {
+    type: 'scatter',
+    data: { datasets },
+    options: {
+      responsive: false,
+      animation: false,
+      showLine: true,
+      scales: {
+        x: {
+          type: 'linear',
+          min: 1,
+          max: 366,
+          ticks: {
+            callback: (val) => {
+              const idx = monthStarts.indexOf(val);
+              return idx >= 0 ? monthLabels[idx] : '';
+            },
+            values: monthStarts,
+            font: { size: 10, family: 'sans-serif' },
+            color: '#6B6B6B',
+          },
+          grid: { color: '#F0EDE8' },
+        },
+        y: {
+          title: {
+            display: true,
+            text: '°C',
+            font: { size: 11, family: 'sans-serif' },
+            color: '#6B6B6B',
+          },
+          ticks: {
+            font: { size: 10, family: 'sans-serif' },
+            color: '#6B6B6B',
+          },
+          grid: { color: '#F0EDE8' },
+        },
+      },
+      plugins: {
+        title: {
+          display: true,
+          text: 'Bala Bay Water Temperature — Year over Year',
+          font: { size: 13, weight: '600', family: 'sans-serif' },
+          color: '#0B1D33',
+          padding: { bottom: 8 },
+        },
+        legend: { display: false },
+        tooltip: { enabled: false },
+      },
+      layout: {
+        padding: { left: 4, right: 12, top: 4, bottom: 4 },
+      },
+    },
+  };
+
+  const buffer = await chartJSNodeCanvas.renderToBuffer(config);
+  console.log(`  Spaghetti chart: ${buffer.length} bytes PNG`);
+  return buffer;
+}
+
 // ── Fetch all data for a station: realtime + 5-year daily-mean history, then
 //    derive July avg, low water, and a combined daily series used for the
 //    chart, day-change metrics, and the CSV attachment. ──
@@ -325,9 +487,12 @@ async function main() {
   // Convert delta and values to inches relative to July average
   const deltaIn = deltaCm !== null ? deltaCm / 2.54 : null;
 
-  // 4. Fetch water temperature (satellite SST)
-  console.log('Fetching water temperature...');
-  const waterTemp = await fetchWaterTemp();
+  // 4. Fetch water temperature: current + historical for spaghetti chart
+  console.log('Fetching water temperature (current + historical)...');
+  const [waterTemp, historicalTempRecords] = await Promise.all([
+    fetchWaterTemp(),
+    fetchHistoricalWaterTemp(),
+  ]);
   if (waterTemp) {
     console.log(`  Water temp: ${waterTemp.tempC}°C (${(waterTemp.tempC * 9/5 + 32).toFixed(0)}°F) — ${waterTemp.date}`);
   } else {
@@ -396,6 +561,16 @@ async function main() {
     console.log('\n── Diagnostic CSV ──');
     for (const row of csvRows) console.log(row);
     console.log('── End CSV ──\n');
+  }
+
+  // 6b. Build temperature spaghetti chart (PNG)
+  let tempChartBuffer = null;
+  try {
+    if (historicalTempRecords && historicalTempRecords.length > 0) {
+      tempChartBuffer = await buildTempSpaghettiChart(historicalTempRecords);
+    }
+  } catch (e) {
+    console.log(`  Spaghetti chart generation failed: ${e.message}`);
   }
 
   // 7. Build and send email
@@ -618,6 +793,19 @@ async function main() {
       </div>
       ` : ''}
 
+      ${tempChartBuffer ? `
+      <!-- Water Temperature Spaghetti Chart -->
+      <div style="margin-bottom:16px;">
+        <img src="cid:temp-spaghetti-chart" alt="Water temperature year-over-year chart" style="width:100%;max-width:560px;height:auto;border-radius:8px;border:1px solid #E0DAD2;" />
+        <div style="margin-top:6px;font-size:9px;color:#999;">
+          <span style="display:inline-block;width:16px;border-top:2.5px solid #2D6A9F;vertical-align:middle;margin-right:4px;"></span>${CURRENT_YEAR} YTD
+          <span style="display:inline-block;width:16px;border-top:1.5px solid #444;vertical-align:middle;margin-left:10px;margin-right:4px;"></span>${CURRENT_YEAR - 1}
+          <span style="display:inline-block;width:16px;border-top:1px solid rgba(180,180,180,0.6);vertical-align:middle;margin-left:10px;margin-right:4px;"></span>2002\u2013${CURRENT_YEAR - 2}
+        </div>
+        <div style="font-size:8px;color:#BBB;margin-top:2px;">Source: NOAA MUR SST v4.1</div>
+      </div>
+      ` : ''}
+
       ${julyAvg !== null ? `
       <!-- Delta -->
       <div style="background:#F8F6F2;border-radius:8px;padding:12px 16px;margin-bottom:16px;">
@@ -749,7 +937,14 @@ async function main() {
       subject: `🌊 Bala Bay: ${deltaSign}${deltaIn?.toFixed(1) ?? '?'} in vs July avg${waterTemp ? ` · ${waterTemp.tempC.toFixed(0)}°C` : ''}`,
       html: html,
       text: text,
-      attachments: [csvAttachment],
+      attachments: [
+        csvAttachment,
+        ...(tempChartBuffer ? [{
+          filename: 'temp-spaghetti-chart.png',
+          content: tempChartBuffer.toString('base64'),
+          content_id: 'temp-spaghetti-chart',
+        }] : []),
+      ],
     }),
   });
 
