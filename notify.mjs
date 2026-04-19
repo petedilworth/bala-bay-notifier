@@ -36,6 +36,13 @@ const EXTRA_STATIONS = [
   { id: '02EB008', name: 'Baysville', label: 'S. Branch Muskoka R.' },
 ];
 
+// Historical high water marks (metres) — station ID → { level, year }
+const HIGH_WATER_MARKS = {
+  '02EB015': { level: 226.051, year: 2019 },
+  '02EB018': { level: 10.461, year: 2019 },
+  '02EB020': { level: 9.35, year: 2013 },
+};
+
 // Flow rate stations (discharge in m³/s) — WSC gauges on the rivers
 const FLOW_STATIONS = [
   { id: '02EB006', name: 'Bala', label: 'Muskoka River' },
@@ -582,11 +589,13 @@ async function main() {
 
   // Water level chart builder: 60-day bar chart with July-avg reference line.
   // Returns an HTML fragment; when isFirst is false a top border separates it from the chart above.
-  function buildWaterLevelChart(name, label, days, stJulyAvg, isFirst) {
+  function buildWaterLevelChart(name, label, days, stJulyAvg, isFirst, stationId) {
     if (!days || days.length === 0) return '';
     const chartDays = days.slice(-60);
+    const hwm = stationId ? HIGH_WATER_MARKS[stationId] : null;
     const minVal = Math.min(...chartDays.map(d => d.value));
-    const maxVal = Math.max(...chartDays.map(d => d.value));
+    const rawMax = Math.max(...chartDays.map(d => d.value));
+    const maxVal = hwm && hwm.level > rawMax ? hwm.level : rawMax;
     const range = maxVal - minVal || 0.01;
     const chartHeight = 120; // px
 
@@ -608,6 +617,12 @@ async function main() {
       refLinePx = Math.round(refPct * (chartHeight - 10) + 3);
     }
 
+    let hwmLinePx = null;
+    if (hwm && hwm.level >= minVal && hwm.level <= maxVal) {
+      const hwmPct = (hwm.level - minVal) / range;
+      hwmLinePx = Math.round(hwmPct * (chartHeight - 10) + 3);
+    }
+
     const latest = chartDays[chartDays.length - 1];
     const vsJulyStr = stJulyAvg !== null
       ? (() => {
@@ -627,6 +642,7 @@ async function main() {
         <div style="display:inline-block;">
           <div style="position:relative;border-bottom:1px solid #E0DAD2;padding-left:2px;">
             ${refLinePx !== null ? `<div style="position:absolute;left:0;right:0;bottom:${refLinePx}px;border-top:1px dashed #5BA88A;z-index:1;"><span style="position:absolute;right:0;top:-10px;font-size:8px;color:#5BA88A;">Jul avg</span></div>` : ''}
+            ${hwmLinePx !== null ? `<div style="position:absolute;left:0;right:0;bottom:${hwmLinePx}px;border-top:1px dashed #C0392B;z-index:1;"><span style="position:absolute;right:0;top:-10px;font-size:8px;color:#C0392B;">${hwm.year} high</span></div>` : ''}
             <table style="border-collapse:collapse;height:${chartHeight}px;"><tr>${bars}</tr></table>
           </div>
           <table style="width:100%;border-collapse:collapse;margin-top:2px;"><tr>
@@ -639,6 +655,7 @@ async function main() {
           <span style="display:inline-block;width:8px;height:8px;background:#4A9BD9;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Daily level
           <span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Today
           ${refLinePx !== null ? '<span style="display:inline-block;width:12px;border-top:1px dashed #5BA88A;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Jul avg' : ''}
+          ${hwmLinePx !== null ? `<span style="display:inline-block;width:12px;border-top:1px dashed #C0392B;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>${hwm.year} high` : ''}
         </div>
       </div>`;
   }
@@ -697,28 +714,22 @@ async function main() {
 
   // Build area water levels table
   const areaTableHtml = (() => {
-    const td = 'padding:4px 6px;font-size:11px;color:#0B1D33;border-bottom:1px solid #F0EDE8;white-space:nowrap;';
-    const th = 'padding:4px 6px;font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:0.3px;color:#6B6B6B;border-bottom:2px solid #E0DAD2;white-space:nowrap;';
+    const td = 'padding:3px 4px;font-size:10px;color:#0B1D33;border-bottom:1px solid #F0EDE8;white-space:nowrap;';
+    const th = 'padding:3px 4px;font-size:8px;font-weight:600;text-transform:uppercase;letter-spacing:0.3px;color:#6B6B6B;border-bottom:2px solid #E0DAD2;white-space:nowrap;';
     const tdr = td + 'text-align:right;';
     const thr = th + 'text-align:right;';
 
-    function fmtDate(d) {
-      if (!d) return '\u2014';
-      const dt = new Date(d + 'T12:00:00');
-      return dt.toLocaleDateString('en-CA', { month: 'short', day: 'numeric' });
-    }
-
-    function buildRow(name, label, days, stJulyAvg, lowWater, isBala) {
+    function buildRow(name, label, days, stJulyAvg, lowWater, isBala, stationId) {
       if (!days || days.length === 0) return '';
       const lat = days[days.length - 1];
       const level = lat.value;
 
-      const lowDate = lowWater ? fmtDate(lowWater.date) : '\u2014';
-      const aboveLow = lowWater ? ((level - lowWater.value) * 100 / 2.54) : null;
-      const aboveLowStr = aboveLow !== null ? (aboveLow >= 0 ? '+' : '') + aboveLow.toFixed(1) : '\u2014';
-
       const belowSummer = stJulyAvg !== null ? ((level - stJulyAvg) * 100 / 2.54) : null;
       const belowSummerStr = belowSummer !== null ? (belowSummer >= 0 ? '+' : '') + belowSummer.toFixed(1) : '\u2014';
+
+      const hwm = HIGH_WATER_MARKS[stationId];
+      const vsHigh = hwm ? ((level - hwm.level) * 100 / 2.54) : null;
+      const vsHighStr = vsHigh !== null ? (vsHigh >= 0 ? '+' : '') + vsHigh.toFixed(1) : '\u2014';
 
       function dayChange(n) {
         if (days.length <= n) return '\u2014';
@@ -730,32 +741,30 @@ async function main() {
       const bold = isBala ? 'font-weight:600;' : '';
       return '<tr>'
         + '<td style="' + td + bold + '">' + name + '</td>'
-        + '<td style="' + td + 'font-size:10px;color:#6B6B6B;">' + label + '</td>'
+        + '<td style="' + td + 'font-size:9px;color:#6B6B6B;">' + label + '</td>'
         + '<td style="' + tdr + '">' + level.toFixed(3) + '</td>'
-        + '<td style="' + tdr + '">' + lowDate + '</td>'
-        + '<td style="' + tdr + '">' + aboveLowStr + '</td>'
         + '<td style="' + tdr + '">' + belowSummerStr + '</td>'
+        + '<td style="' + tdr + '">' + vsHighStr + '</td>'
         + '<td style="' + tdr + '">' + dayChange(1) + '</td>'
         + '<td style="' + tdr + '">' + dayChange(2) + '</td>'
         + '<td style="' + tdr + '">' + dayChange(3) + '</td>'
         + '</tr>';
     }
 
-    const balaRow = buildRow('Bala', 'Lake Muskoka', recentData, julyAvg, balaLowWater, true);
+    const balaRow = buildRow('Bala', 'Lake Muskoka', recentData, julyAvg, balaLowWater, true, STATION);
     const extraRows = extraResults.filter(s => s.recentDays).map(s =>
-      buildRow(s.name, s.label, s.recentDays, s.julyAvg, s.lowWater, false)
+      buildRow(s.name, s.label, s.recentDays, s.julyAvg, s.lowWater, false, s.id)
     ).join('');
 
     return '<div style="margin-bottom:16px;overflow-x:auto;">'
       + '<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:8px;">Area Water Levels</div>'
       + '<table style="width:100%;border-collapse:collapse;">'
       + '<tr>'
-      + '<th style="' + th + '">Station</th>'
+      + '<th style="' + th + '">Stn</th>'
       + '<th style="' + th + '">Water</th>'
-      + '<th style="' + thr + '">Level (m)</th>'
-      + '<th style="' + thr + '">Low Date</th>'
-      + '<th style="' + thr + '">\u2191 Low (in)</th>'
-      + '<th style="' + thr + '">\u2193 Summer (in)</th>'
+      + '<th style="' + thr + '">Lvl (m)</th>'
+      + '<th style="' + thr + '">vs Sum</th>'
+      + '<th style="' + thr + '">vs Hi</th>'
       + '<th style="' + thr + '">1d</th>'
       + '<th style="' + thr + '">2d</th>'
       + '<th style="' + thr + '">3d</th>'
@@ -828,10 +837,10 @@ async function main() {
       ${areaTableHtml}
 
       <!-- Water Level Charts: Bala + extra stations -->
-      ${buildWaterLevelChart('Bala', 'Lake Muskoka', recentData, julyAvg, true)}
+      ${buildWaterLevelChart('Bala', 'Lake Muskoka', recentData, julyAvg, true, STATION)}
       ${extraResults
         .filter(s => s.recentDays && s.recentDays.length > 0)
-        .map(s => buildWaterLevelChart(s.name, s.label, s.recentDays, s.julyAvg, false))
+        .map(s => buildWaterLevelChart(s.name, s.label, s.recentDays, s.julyAvg, false, s.id))
         .join('')}
 
       <!-- Flow Rate Charts -->
