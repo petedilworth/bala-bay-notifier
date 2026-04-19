@@ -587,77 +587,185 @@ async function main() {
     weekday: 'long', month: 'long', day: 'numeric', year: 'numeric'
   });
 
-  // Water level chart builder: 60-day bar chart with July-avg reference line.
-  // Returns an HTML fragment; when isFirst is false a top border separates it from the chart above.
-  function buildWaterLevelChart(name, label, days, stJulyAvg, isFirst, stationId) {
-    if (!days || days.length === 0) return '';
+  // Pre-render water level chart images (PNG)
+  const waterLevelChartInputs = [
+    { name: 'Bala', label: 'Lake Muskoka', days: recentData, julyAvg, stationId: STATION, isFirst: true },
+    ...extraResults
+      .filter(s => s.recentDays && s.recentDays.length > 0)
+      .map(s => ({ name: s.name, label: s.label, days: s.recentDays, julyAvg: s.julyAvg, stationId: s.id, isFirst: false })),
+  ];
+  const waterLevelCharts = [];
+  for (const input of waterLevelChartInputs) {
+    try {
+      const result = await buildWaterLevelChart(input.name, input.label, input.days, input.julyAvg, input.isFirst, input.stationId);
+      if (result) waterLevelCharts.push(result);
+    } catch (e) {
+      console.log(`  Chart for ${input.name} failed: ${e.message}`);
+    }
+  }
+
+  // Water level chart builder: 60-day bar chart rendered as PNG image.
+  // Returns { html, buffer, cid } where buffer is the PNG and cid is the Content-ID.
+  async function buildWaterLevelChart(name, label, days, stJulyAvg, isFirst, stationId) {
+    if (!days || days.length === 0) return null;
     const chartDays = days.slice(-60);
     const hwm = stationId ? HIGH_WATER_MARKS[stationId] : null;
-    const minVal = Math.min(...chartDays.map(d => d.value));
-    const rawMax = Math.max(...chartDays.map(d => d.value));
-    const maxVal = hwm && hwm.level > rawMax ? hwm.level : rawMax;
-    const range = maxVal - minVal || 0.01;
-    const chartHeight = 120; // px
-
-    const bars = chartDays.map((d, i) => {
-      const pct = (d.value - minVal) / range;
-      const height = Math.max(3, Math.round(pct * (chartHeight - 10) + 3));
-      const color = i === chartDays.length - 1 ? '#E07B4C' : '#4A9BD9';
-      return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:6px;height:${height}px;background:${color};border-radius:1px;" title="${d.date}: ${d.value.toFixed(3)}m"></div></td>`;
-    }).join('');
-
-    const fmtShort = (d) => new Date(d.date + 'T12:00:00').toLocaleDateString('en-CA', { month: 'short', day: 'numeric' });
-    const firstDate = chartDays[0];
-    const midDate = chartDays[Math.floor(chartDays.length / 2)];
-    const lastDate = chartDays[chartDays.length - 1];
-
-    let refLinePx = null;
-    if (stJulyAvg !== null && stJulyAvg >= minVal && stJulyAvg <= maxVal) {
-      const refPct = (stJulyAvg - minVal) / range;
-      refLinePx = Math.round(refPct * (chartHeight - 10) + 3);
-    }
-
-    let hwmLinePx = null;
-    if (hwm && hwm.level >= minVal && hwm.level <= maxVal) {
-      const hwmPct = (hwm.level - minVal) / range;
-      hwmLinePx = Math.round(hwmPct * (chartHeight - 10) + 3);
-    }
 
     const latest = chartDays[chartDays.length - 1];
     const vsJulyStr = stJulyAvg !== null
       ? (() => {
           const diffIn = (latest.value - stJulyAvg) * 100 / 2.54;
-          return ` · ${diffIn >= 0 ? '+' : ''}${diffIn.toFixed(1)}in vs Jul avg`;
+          return ` \u00b7 ${diffIn >= 0 ? '+' : ''}${diffIn.toFixed(1)}in vs Jul avg`;
         })()
       : '';
+
+    const fmtShort = (d) => new Date(d.date + 'T12:00:00').toLocaleDateString('en-CA', { month: 'short', day: 'numeric' });
+
+    const barColors = chartDays.map((_, i) =>
+      i === chartDays.length - 1 ? '#E07B4C' : '#4A9BD9'
+    );
+
+    const refLinesPlugin = {
+      id: 'refLines',
+      afterDraw(chart) {
+        const ctx = chart.ctx;
+        const yScale = chart.scales.y;
+        const { left, right } = chart.chartArea;
+
+        if (stJulyAvg !== null) {
+          const y = yScale.getPixelForValue(stJulyAvg);
+          if (y >= chart.chartArea.top && y <= chart.chartArea.bottom) {
+            ctx.save();
+            ctx.setLineDash([4, 3]);
+            ctx.strokeStyle = '#5BA88A';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(left, y);
+            ctx.lineTo(right, y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.font = '10px sans-serif';
+            ctx.fillStyle = '#5BA88A';
+            ctx.textAlign = 'right';
+            ctx.fillText('Jul avg', right, y - 4);
+            ctx.restore();
+          }
+        }
+
+        if (hwm) {
+          const y = yScale.getPixelForValue(hwm.level);
+          if (y >= chart.chartArea.top - 5 && y <= chart.chartArea.bottom) {
+            ctx.save();
+            ctx.setLineDash([4, 3]);
+            ctx.strokeStyle = '#C0392B';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(left, y);
+            ctx.lineTo(right, y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.font = '10px sans-serif';
+            ctx.fillStyle = '#C0392B';
+            ctx.textAlign = 'right';
+            ctx.fillText(`${hwm.year} high`, right, y - 4);
+            ctx.restore();
+          }
+        }
+      }
+    };
+
+    const chartWidth = 520;
+    const chartHeight = 150;
+    const chartJSNodeCanvas = new ChartJSNodeCanvas({
+      width: chartWidth,
+      height: chartHeight,
+      backgroundColour: '#FFFFFF',
+    });
+
+    const yMin = Math.min(...chartDays.map(d => d.value));
+    const yMax = Math.max(...chartDays.map(d => d.value), stJulyAvg ?? 0, hwm ? hwm.level : 0);
+    const yPadding = (yMax - yMin) * 0.08 || 0.01;
+
+    const config = {
+      type: 'bar',
+      plugins: [refLinesPlugin],
+      data: {
+        labels: chartDays.map(d => fmtShort(d)),
+        datasets: [{
+          data: chartDays.map(d => d.value),
+          backgroundColor: barColors,
+          borderWidth: 0,
+          barPercentage: 0.9,
+          categoryPercentage: 0.95,
+        }],
+      },
+      options: {
+        responsive: false,
+        animation: false,
+        scales: {
+          x: {
+            ticks: {
+              maxTicksLimit: 5,
+              font: { size: 9, family: 'sans-serif' },
+              color: '#999',
+            },
+            grid: { display: false },
+          },
+          y: {
+            min: yMin - yPadding,
+            max: yMax + yPadding,
+            ticks: {
+              font: { size: 9, family: 'sans-serif' },
+              color: '#6B6B6B',
+              callback: (v) => v.toFixed(2),
+              maxTicksLimit: 5,
+            },
+            grid: { color: '#F0EDE8' },
+          },
+        },
+        plugins: {
+          title: {
+            display: true,
+            text: [`${name} — ${label}`, `Water Level — Last ${chartDays.length} Days${vsJulyStr}`],
+            font: [
+              { size: 11, weight: '600', family: 'sans-serif' },
+              { size: 9, weight: 'normal', family: 'sans-serif' },
+            ],
+            color: ['#6B6B6B', '#999'],
+            padding: { bottom: 4 },
+          },
+          legend: { display: false },
+          tooltip: { enabled: false },
+        },
+        layout: { padding: { left: 2, right: 8, top: 0, bottom: 2 } },
+      },
+    };
+
+    const buffer = await chartJSNodeCanvas.renderToBuffer(config);
+    const cid = `water-chart-${stationId || name.toLowerCase()}`;
 
     const sectionStyle = isFirst
       ? 'margin-top:12px;'
       : 'margin-top:20px;border-top:1px solid #E0DAD2;padding-top:16px;';
 
-    return `
+    const legendItems = [
+      '<span style="display:inline-block;width:8px;height:8px;background:#4A9BD9;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Daily level',
+      '<span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Today',
+    ];
+    if (stJulyAvg !== null) {
+      legendItems.push('<span style="display:inline-block;width:12px;border-top:1px dashed #5BA88A;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Jul avg');
+    }
+    if (hwm) {
+      legendItems.push(`<span style="display:inline-block;width:12px;border-top:1px dashed #C0392B;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>${hwm.year} high`);
+    }
+
+    const html = `
       <div style="${sectionStyle}">
-        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:2px;">${name} — ${label}</div>
-        <div style="font-size:9px;color:#999;margin-bottom:8px;">Water Level — Last ${chartDays.length} Days${vsJulyStr}</div>
-        <div style="display:inline-block;">
-          <div style="position:relative;border-bottom:1px solid #E0DAD2;padding-left:2px;">
-            ${refLinePx !== null ? `<div style="position:absolute;left:0;right:0;bottom:${refLinePx}px;border-top:1px dashed #5BA88A;z-index:1;"><span style="position:absolute;right:0;top:-10px;font-size:8px;color:#5BA88A;">Jul avg</span></div>` : ''}
-            ${hwmLinePx !== null ? `<div style="position:absolute;left:0;right:0;bottom:${hwmLinePx}px;border-top:1px dashed #C0392B;z-index:1;"><span style="position:absolute;right:0;top:-10px;font-size:8px;color:#C0392B;">${hwm.year} high</span></div>` : ''}
-            <table style="border-collapse:collapse;height:${chartHeight}px;"><tr>${bars}</tr></table>
-          </div>
-          <table style="width:100%;border-collapse:collapse;margin-top:2px;"><tr>
-            <td style="font-size:9px;color:#999;text-align:left;padding:0;">${fmtShort(firstDate)}</td>
-            <td style="font-size:9px;color:#999;text-align:center;padding:0;">${fmtShort(midDate)}</td>
-            <td style="font-size:9px;color:#6B6B6B;text-align:right;font-weight:600;padding:0;">${fmtShort(lastDate)}</td>
-          </tr></table>
-        </div>
-        <div style="margin-top:6px;font-size:9px;color:#999;">
-          <span style="display:inline-block;width:8px;height:8px;background:#4A9BD9;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Daily level
-          <span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Today
-          ${refLinePx !== null ? '<span style="display:inline-block;width:12px;border-top:1px dashed #5BA88A;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Jul avg' : ''}
-          ${hwmLinePx !== null ? `<span style="display:inline-block;width:12px;border-top:1px dashed #C0392B;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>${hwm.year} high` : ''}
-        </div>
+        <img src="cid:${cid}" alt="${name} water level chart" style="width:100%;max-width:${chartWidth}px;height:auto;border-radius:4px;" />
+        <div style="margin-top:4px;font-size:9px;color:#999;">${legendItems.join('\n          ')}</div>
       </div>`;
+
+    return { html, buffer, cid };
   }
 
   // Flow rate chart builder: 60-day bar chart for discharge (m³/s).
@@ -837,11 +945,7 @@ async function main() {
       ${areaTableHtml}
 
       <!-- Water Level Charts: Bala + extra stations -->
-      ${buildWaterLevelChart('Bala', 'Lake Muskoka', recentData, julyAvg, true, STATION)}
-      ${extraResults
-        .filter(s => s.recentDays && s.recentDays.length > 0)
-        .map(s => buildWaterLevelChart(s.name, s.label, s.recentDays, s.julyAvg, false, s.id))
-        .join('')}
+      ${waterLevelCharts.map(c => c.html).join('')}
 
       <!-- Flow Rate Charts -->
       ${flowResults.filter(s => s.recentDays && s.recentDays.length > 0).length > 0 ? `
@@ -955,6 +1059,11 @@ async function main() {
           content: tempChartBuffer.toString('base64'),
           content_id: 'temp-spaghetti-chart',
         }] : []),
+        ...waterLevelCharts.map(c => ({
+          filename: `${c.cid}.png`,
+          content: c.buffer.toString('base64'),
+          content_id: c.cid,
+        })),
       ],
     }),
   });
