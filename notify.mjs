@@ -714,25 +714,15 @@ async function main() {
 
   // Build area water levels table
   const areaTableHtml = (() => {
-    const td = 'padding:4px 6px;font-size:11px;color:#0B1D33;border-bottom:1px solid #F0EDE8;white-space:nowrap;';
-    const th = 'padding:4px 6px;font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:0.3px;color:#6B6B6B;border-bottom:2px solid #E0DAD2;white-space:nowrap;';
+    const td = 'padding:3px 4px;font-size:10px;color:#0B1D33;border-bottom:1px solid #F0EDE8;white-space:nowrap;';
+    const th = 'padding:3px 4px;font-size:8px;font-weight:600;text-transform:uppercase;letter-spacing:0.3px;color:#6B6B6B;border-bottom:2px solid #E0DAD2;white-space:nowrap;';
     const tdr = td + 'text-align:right;';
     const thr = th + 'text-align:right;';
-
-    function fmtDate(d) {
-      if (!d) return '\u2014';
-      const dt = new Date(d + 'T12:00:00');
-      return dt.toLocaleDateString('en-CA', { month: 'short', day: 'numeric' });
-    }
 
     function buildRow(name, label, days, stJulyAvg, lowWater, isBala, stationId) {
       if (!days || days.length === 0) return '';
       const lat = days[days.length - 1];
       const level = lat.value;
-
-      const lowDate = lowWater ? fmtDate(lowWater.date) : '\u2014';
-      const aboveLow = lowWater ? ((level - lowWater.value) * 100 / 2.54) : null;
-      const aboveLowStr = aboveLow !== null ? (aboveLow >= 0 ? '+' : '') + aboveLow.toFixed(1) : '\u2014';
 
       const belowSummer = stJulyAvg !== null ? ((level - stJulyAvg) * 100 / 2.54) : null;
       const belowSummerStr = belowSummer !== null ? (belowSummer >= 0 ? '+' : '') + belowSummer.toFixed(1) : '\u2014';
@@ -751,10 +741,8 @@ async function main() {
       const bold = isBala ? 'font-weight:600;' : '';
       return '<tr>'
         + '<td style="' + td + bold + '">' + name + '</td>'
-        + '<td style="' + td + 'font-size:10px;color:#6B6B6B;">' + label + '</td>'
+        + '<td style="' + td + 'font-size:9px;color:#6B6B6B;">' + label + '</td>'
         + '<td style="' + tdr + '">' + level.toFixed(3) + '</td>'
-        + '<td style="' + tdr + '">' + lowDate + '</td>'
-        + '<td style="' + tdr + '">' + aboveLowStr + '</td>'
         + '<td style="' + tdr + '">' + belowSummerStr + '</td>'
         + '<td style="' + tdr + '">' + vsHighStr + '</td>'
         + '<td style="' + tdr + '">' + dayChange(1) + '</td>'
@@ -772,13 +760,11 @@ async function main() {
       + '<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:8px;">Area Water Levels</div>'
       + '<table style="width:100%;border-collapse:collapse;">'
       + '<tr>'
-      + '<th style="' + th + '">Station</th>'
+      + '<th style="' + th + '">Stn</th>'
       + '<th style="' + th + '">Water</th>'
-      + '<th style="' + thr + '">Level (m)</th>'
-      + '<th style="' + thr + '">Low Date</th>'
-      + '<th style="' + thr + '">\u2191 Low (in)</th>'
-      + '<th style="' + thr + '">\u2193 Summer (in)</th>'
-      + '<th style="' + thr + '">\u2193 High (in)</th>'
+      + '<th style="' + thr + '">Lvl (m)</th>'
+      + '<th style="' + thr + '">vs Sum</th>'
+      + '<th style="' + thr + '">vs Hi</th>'
       + '<th style="' + thr + '">1d</th>'
       + '<th style="' + thr + '">2d</th>'
       + '<th style="' + thr + '">3d</th>'
