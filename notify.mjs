@@ -244,13 +244,18 @@ async function fetchHistoricalWaterTemp() {
       startDate = '2002-06-01';
     }
 
-    if (startDate > TODAY_ISO) {
+    // MUR SST data lags ~2 days behind real-time
+    const endDt = new Date();
+    endDt.setUTCDate(endDt.getUTCDate() - 3);
+    const endDate = endDt.toISOString().substring(0, 10);
+
+    if (startDate > endDate) {
       console.log(`  Historical temp: cache is current (${cached.length} records)`);
       return cached;
     }
 
-    console.log(`  Fetching temp data from ${startDate} to ${TODAY_ISO}${latestCached ? ` (${cached.length} cached)` : ' (full fetch)'}...`);
-    const url = `${ERDDAP_BASE}/jplMURSST41.csv?analysed_sst[(${startDate}):(${TODAY_ISO})][(${BALA_LAT})][(${BALA_LON})]`;
+    console.log(`  Fetching temp data from ${startDate} to ${endDate}${latestCached ? ` (${cached.length} cached)` : ' (full fetch)'}...`);
+    const url = `${ERDDAP_BASE}/jplMURSST41.csv?analysed_sst[(${startDate}):(${endDate})][(${BALA_LAT})][(${BALA_LON})]`;
     const resp = await fetch(url);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const newRecords = parseERDDAPCsv(await resp.text());
