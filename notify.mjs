@@ -963,10 +963,10 @@ async function main() {
       ` : ''}
 
       ${tempChartBuffer ? `
-      <!-- Water Temperature Spaghetti Chart (attached as PNG) -->
-      <div style="margin-bottom:16px;background:#F8F6F2;border-radius:8px;padding:10px 14px;">
-        <div style="font-size:10px;color:#6B6B6B;">Water temperature year-over-year chart attached as <strong>temp-spaghetti-chart.png</strong></div>
-        <div style="margin-top:4px;font-size:9px;color:#999;">
+      <!-- Water Temperature Spaghetti Chart (inline base64 PNG) -->
+      <div style="margin-bottom:16px;">
+        <img src="data:image/png;base64,${tempChartBuffer.toString('base64')}" alt="Water temperature year-over-year chart" style="width:100%;max-width:560px;height:auto;border-radius:8px;border:1px solid #E0DAD2;display:block;" />
+        <div style="margin-top:6px;font-size:9px;color:#999;">
           <span style="display:inline-block;width:16px;border-top:2.5px solid #2D6A9F;vertical-align:middle;margin-right:4px;"></span>${CURRENT_YEAR} YTD
           <span style="display:inline-block;width:16px;border-top:1.5px solid #444;vertical-align:middle;margin-left:10px;margin-right:4px;"></span>${CURRENT_YEAR - 1}
           <span style="display:inline-block;width:16px;border-top:1px solid rgba(180,180,180,0.6);vertical-align:middle;margin-left:10px;margin-right:4px;"></span>2002\u2013${CURRENT_YEAR - 2}
