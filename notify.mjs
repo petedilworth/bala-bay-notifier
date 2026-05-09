@@ -1,4 +1,9 @@
+import fs from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { ChartJSNodeCanvas } from 'chartjs-node-canvas';
+
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
+const TEMP_CSV_PATH = __dirname + 'data/water-temp.csv';
 
 /**
  * Bala Bay Daily Water Level Notification
@@ -180,38 +185,91 @@ async function fetchWaterTemp() {
 
 // ── Historical water temperature for spaghetti chart (MUR SST v4.1 starts 2002-06-01) ──
 
-async function fetchHistoricalWaterTemp() {
-  const startDate = '2002-06-01';
-  const url = `${ERDDAP_BASE}/jplMURSST41.csv?analysed_sst[(${startDate}):(${TODAY_ISO})][(${BALA_LAT})][(${BALA_LON})]`;
+function toRecord(dateStr, tempC) {
+  const year = parseInt(dateStr.substring(0, 4));
+  const dt = new Date(dateStr + 'T00:00:00Z');
+  const jan1 = new Date(Date.UTC(year, 0, 1));
+  const dayOfYear = Math.floor((dt - jan1) / 86400000) + 1;
+  return { date: dateStr, year, dayOfYear, tempC };
+}
+
+async function loadCachedTemp() {
   try {
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const text = await resp.text();
-
-    const lines = text.split('\n');
-    // Line 1: header, Line 2: units, Lines 3+: data
-    const dataLines = lines.slice(2).filter(l => l.trim());
-
+    const csv = await fs.readFile(TEMP_CSV_PATH, 'utf8');
+    const lines = csv.trim().split('\n').slice(1); // skip header
     const records = [];
-    for (const line of dataLines) {
-      const parts = line.split(',');
-      if (parts.length < 4) continue;
-      const dateStr = parts[0].substring(0, 10);
-      const sst = parseFloat(parts[3]);
-      if (isNaN(sst)) continue;
+    for (const line of lines) {
+      const [date, temp] = line.split(',');
+      const tempC = parseFloat(temp);
+      if (date && !isNaN(tempC)) records.push(toRecord(date, tempC));
+    }
+    return records;
+  } catch {
+    return [];
+  }
+}
 
-      const year = parseInt(dateStr.substring(0, 4));
-      const dt = new Date(dateStr + 'T00:00:00Z');
-      const jan1 = new Date(Date.UTC(year, 0, 1));
-      const dayOfYear = Math.floor((dt - jan1) / 86400000) + 1;
+async function saveTempCache(records) {
+  await fs.mkdir(__dirname + 'data', { recursive: true });
+  const rows = records.map(r => `${r.date},${r.tempC}`);
+  await fs.writeFile(TEMP_CSV_PATH, 'date,tempC\n' + rows.join('\n') + '\n', 'utf8');
+}
 
-      records.push({ date: dateStr, year, dayOfYear, tempC: sst });
+function parseERDDAPCsv(text) {
+  const lines = text.split('\n');
+  // Line 1: header, Line 2: units, Lines 3+: data
+  const dataLines = lines.slice(2).filter(l => l.trim());
+  const records = [];
+  for (const line of dataLines) {
+    const parts = line.split(',');
+    if (parts.length < 4) continue;
+    const dateStr = parts[0].substring(0, 10);
+    const sst = parseFloat(parts[3]);
+    if (!isNaN(sst)) records.push(toRecord(dateStr, sst));
+  }
+  return records;
+}
+
+async function fetchHistoricalWaterTemp() {
+  try {
+    const cached = await loadCachedTemp();
+    const latestCached = cached.length > 0 ? cached[cached.length - 1].date : null;
+
+    let startDate;
+    if (latestCached) {
+      const next = new Date(latestCached + 'T12:00:00Z');
+      next.setUTCDate(next.getUTCDate() + 1);
+      startDate = next.toISOString().substring(0, 10);
+    } else {
+      startDate = '2002-06-01';
     }
 
-    console.log(`  Historical temp: ${records.length} records across ${new Set(records.map(r => r.year)).size} years`);
-    return records;
+    if (startDate > TODAY_ISO) {
+      console.log(`  Historical temp: cache is current (${cached.length} records)`);
+      return cached;
+    }
+
+    console.log(`  Fetching temp data from ${startDate} to ${TODAY_ISO}${latestCached ? ` (${cached.length} cached)` : ' (full fetch)'}...`);
+    const url = `${ERDDAP_BASE}/jplMURSST41.csv?analysed_sst[(${startDate}):(${TODAY_ISO})][(${BALA_LAT})][(${BALA_LON})]`;
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const newRecords = parseERDDAPCsv(await resp.text());
+
+    // Merge: cached + new, deduplicate by date
+    const byDate = new Map(cached.map(r => [r.date, r]));
+    for (const r of newRecords) byDate.set(r.date, r);
+    const all = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+
+    await saveTempCache(all);
+    console.log(`  Historical temp: ${all.length} records across ${new Set(all.map(r => r.year)).size} years (${newRecords.length} new)`);
+    return all;
   } catch (e) {
     console.log(`  Historical water temp fetch failed: ${e.message}`);
+    const cached = await loadCachedTemp();
+    if (cached.length > 0) {
+      console.log(`  Falling back to cached data (${cached.length} records)`);
+      return cached;
+    }
     return null;
   }
 }
