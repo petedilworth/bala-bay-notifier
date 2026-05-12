@@ -254,11 +254,26 @@ async function fetchHistoricalWaterTemp() {
       return cached;
     }
 
-    console.log(`  Fetching temp data from ${startDate} to ${endDate}${latestCached ? ` (${cached.length} cached)` : ' (full fetch)'}...`);
-    const url = `${ERDDAP_BASE}/jplMURSST41.csv?analysed_sst[(${startDate}):(${endDate})][(${BALA_LAT})][(${BALA_LON})]`;
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const newRecords = parseERDDAPCsv(await resp.text());
+    // Try progressively shorter date ranges if ERDDAP 404s
+    const startDates = [startDate, '2010-01-01', '2015-01-01', '2020-01-01'];
+    let newRecords = null;
+    for (const tryStart of startDates) {
+      if (tryStart > endDate) continue;
+      const url = `${ERDDAP_BASE}/jplMURSST41.csv?analysed_sst[(${tryStart}):(${endDate})][(${BALA_LAT})][(${BALA_LON})]`;
+      console.log(`  Trying ERDDAP: ${tryStart} to ${endDate}${latestCached ? ` (${cached.length} cached)` : ' (full fetch)'}...`);
+      const resp = await fetch(url);
+      if (resp.ok) {
+        newRecords = parseERDDAPCsv(await resp.text());
+        console.log(`  ERDDAP returned ${newRecords.length} records (from ${tryStart})`);
+        break;
+      }
+      console.log(`  ERDDAP HTTP ${resp.status} for start=${tryStart}, trying shorter range...`);
+    }
+
+    if (!newRecords || newRecords.length === 0) {
+      console.log(`  All ERDDAP date ranges failed`);
+      return cached.length > 0 ? cached : null;
+    }
 
     // Merge: cached + new, deduplicate by date
     const byDate = new Map(cached.map(r => [r.date, r]));
@@ -266,7 +281,7 @@ async function fetchHistoricalWaterTemp() {
     const all = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
 
     await saveTempCache(all);
-    console.log(`  Historical temp: ${all.length} records across ${new Set(all.map(r => r.year)).size} years (${newRecords.length} new)`);
+    console.log(`  Historical temp: ${all.length} records across ${new Set(all.map(r => r.year)).size} years`);
     return all;
   } catch (e) {
     console.log(`  Historical water temp fetch failed: ${e.message}`);
