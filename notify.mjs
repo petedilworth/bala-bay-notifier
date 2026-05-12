@@ -254,24 +254,62 @@ async function fetchHistoricalWaterTemp() {
       return cached;
     }
 
+    // MUR SST timestamps are at 09:00 UTC — use explicit time to avoid ERDDAP 404
+    const startTs = `${startDate}T09:00:00Z`;
+    const endTs = `${endDate}T09:00:00Z`;
+
     // Try progressively shorter date ranges if ERDDAP 404s
-    const startDates = [startDate, '2010-01-01', '2015-01-01', '2020-01-01'];
+    const startDates = [startTs, '2010-01-01T09:00:00Z', '2015-01-01T09:00:00Z', '2020-01-01T09:00:00Z'];
     let newRecords = null;
     for (const tryStart of startDates) {
-      if (tryStart > endDate) continue;
-      const url = `${ERDDAP_BASE}/jplMURSST41.csv?analysed_sst[(${tryStart}):(${endDate})][(${BALA_LAT})][(${BALA_LON})]`;
-      console.log(`  Trying ERDDAP: ${tryStart} to ${endDate}${latestCached ? ` (${cached.length} cached)` : ' (full fetch)'}...`);
+      if (tryStart > endTs) continue;
+      const url = `${ERDDAP_BASE}/jplMURSST41.csv?analysed_sst[(${tryStart}):(${endTs})][(${BALA_LAT})][(${BALA_LON})]`;
+      console.log(`  Trying ERDDAP CSV: ${tryStart} to ${endTs}...`);
       const resp = await fetch(url);
       if (resp.ok) {
         newRecords = parseERDDAPCsv(await resp.text());
         console.log(`  ERDDAP returned ${newRecords.length} records (from ${tryStart})`);
         break;
       }
-      console.log(`  ERDDAP HTTP ${resp.status} for start=${tryStart}, trying shorter range...`);
+      const errBody = await resp.text().catch(() => '');
+      console.log(`  ERDDAP HTTP ${resp.status} for ${tryStart}: ${errBody.substring(0, 300)}`);
+    }
+
+    // Fallback: try JSON endpoint (same format as the working current-temp fetch)
+    if (!newRecords || newRecords.length === 0) {
+      console.log(`  CSV attempts failed, trying JSON endpoint...`);
+      for (const tryStart of ['2020-01-01T09:00:00Z', '2023-01-01T09:00:00Z']) {
+        const url = `${ERDDAP_BASE}/jplMURSST41.json?analysed_sst[(${tryStart}):(${endTs})][(${BALA_LAT})][(${BALA_LON})]`;
+        console.log(`  Trying ERDDAP JSON: ${tryStart} to ${endTs}...`);
+        try {
+          const resp = await fetch(url);
+          if (!resp.ok) {
+            const errBody = await resp.text().catch(() => '');
+            console.log(`  ERDDAP JSON HTTP ${resp.status}: ${errBody.substring(0, 300)}`);
+            continue;
+          }
+          const data = await resp.json();
+          const rows = data?.table?.rows;
+          if (rows && rows.length > 0) {
+            newRecords = [];
+            for (const row of rows) {
+              const dateStr = row[0]?.substring(0, 10);
+              const sst = row[3];
+              if (dateStr && sst != null && !isNaN(sst)) {
+                newRecords.push(toRecord(dateStr, Math.round(sst * 10) / 10));
+              }
+            }
+            console.log(`  ERDDAP JSON returned ${newRecords.length} records`);
+            break;
+          }
+        } catch (je) {
+          console.log(`  ERDDAP JSON failed: ${je.message}`);
+        }
+      }
     }
 
     if (!newRecords || newRecords.length === 0) {
-      console.log(`  All ERDDAP date ranges failed`);
+      console.log(`  All ERDDAP attempts failed`);
       return cached.length > 0 ? cached : null;
     }
 
