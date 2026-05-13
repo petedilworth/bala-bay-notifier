@@ -61,6 +61,11 @@ const FLOW_STATIONS = [
 const BALA_LAT = 45.01;
 const BALA_LON = -79.6;
 const ERDDAP_BASE = 'https://coastwatch.pfeg.noaa.gov/erddap/griddap';
+const ERDDAP_MIRRORS = [
+  'https://upwell.pfeg.noaa.gov/erddap/griddap',
+  'https://coastwatch.pfeg.noaa.gov/erddap/griddap',
+  'https://erddap.marine.usf.edu/erddap/griddap',
+];
 
 // ── Configuration (from environment variables) ──
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
@@ -263,54 +268,65 @@ async function fetchHistoricalWaterTemp() {
 
   let newRecords = null;
 
+  // Try each date range across all mirrors before moving to next range
+  outer:
   for (const tryStart of startDates) {
     const ts = `${tryStart}T09:00:00Z`;
     if (ts > endTs) continue;
-    const url = `${ERDDAP_BASE}/jplMURSST41.csv?analysed_sst[(${ts}):(${endTs})][(${BALA_LAT})][(${BALA_LON})]`;
-    console.log(`  Trying ERDDAP CSV: ${tryStart} to ${endDate} (30s timeout)...`);
-    try {
-      const resp = await fetch(url, { signal: AbortSignal.timeout(30000) });
-      if (resp.ok) {
-        newRecords = parseERDDAPCsv(await resp.text());
-        console.log(`  ERDDAP returned ${newRecords.length} records (from ${tryStart})`);
-        break;
+
+    for (const mirror of ERDDAP_MIRRORS) {
+      const url = `${mirror}/jplMURSST41.csv?analysed_sst[(${ts}):(${endTs})][(${BALA_LAT})][(${BALA_LON})]`;
+      console.log(`  Trying ERDDAP CSV: ${tryStart} to ${endDate} via ${new URL(mirror).hostname} (20s timeout)...`);
+      try {
+        const resp = await fetch(url, { signal: AbortSignal.timeout(20000) });
+        if (resp.ok) {
+          newRecords = parseERDDAPCsv(await resp.text());
+          console.log(`  ERDDAP returned ${newRecords.length} records (from ${tryStart} via ${new URL(mirror).hostname})`);
+          break outer;
+        }
+        const errBody = await resp.text().catch(() => '');
+        console.log(`  ERDDAP HTTP ${resp.status}: ${errBody.substring(0, 300)}`);
+      } catch (e) {
+        console.log(`  ERDDAP CSV failed (${new URL(mirror).hostname}): ${e.message}`);
       }
-      const errBody = await resp.text().catch(() => '');
-      console.log(`  ERDDAP HTTP ${resp.status}: ${errBody.substring(0, 300)}`);
-    } catch (e) {
-      console.log(`  ERDDAP CSV failed for ${tryStart}: ${e.message}`);
     }
   }
 
-  // JSON fallback (same format as the working current-temp fetch)
+  // JSON fallback across all mirrors
   if (!newRecords || newRecords.length === 0) {
-    for (const tryStart of ['2024-01-01', '2022-01-01']) {
+    const jsonStarts = latestCached ? [`${startDate}`] : ['2024-01-01', '2022-01-01'];
+    outer2:
+    for (const tryStart of jsonStarts) {
       const ts = `${tryStart}T09:00:00Z`;
-      const url = `${ERDDAP_BASE}/jplMURSST41.json?analysed_sst[(${ts}):(${endTs})][(${BALA_LAT})][(${BALA_LON})]`;
-      console.log(`  Trying ERDDAP JSON: ${tryStart} to ${endDate} (30s timeout)...`);
-      try {
-        const resp = await fetch(url, { signal: AbortSignal.timeout(30000) });
-        if (!resp.ok) {
-          const errBody = await resp.text().catch(() => '');
-          console.log(`  ERDDAP JSON HTTP ${resp.status}: ${errBody.substring(0, 300)}`);
-          continue;
-        }
-        const data = await resp.json();
-        const rows = data?.table?.rows;
-        if (rows && rows.length > 0) {
-          newRecords = [];
-          for (const row of rows) {
-            const dateStr = row[0]?.substring(0, 10);
-            const sst = row[3];
-            if (dateStr && sst != null && !isNaN(sst)) {
-              newRecords.push(toRecord(dateStr, Math.round(sst * 10) / 10));
-            }
+      if (ts > endTs) continue;
+
+      for (const mirror of ERDDAP_MIRRORS) {
+        const url = `${mirror}/jplMURSST41.json?analysed_sst[(${ts}):(${endTs})][(${BALA_LAT})][(${BALA_LON})]`;
+        console.log(`  Trying ERDDAP JSON: ${tryStart} to ${endDate} via ${new URL(mirror).hostname} (20s timeout)...`);
+        try {
+          const resp = await fetch(url, { signal: AbortSignal.timeout(20000) });
+          if (!resp.ok) {
+            const errBody = await resp.text().catch(() => '');
+            console.log(`  ERDDAP JSON HTTP ${resp.status}: ${errBody.substring(0, 300)}`);
+            continue;
           }
-          console.log(`  ERDDAP JSON returned ${newRecords.length} records`);
-          break;
+          const data = await resp.json();
+          const rows = data?.table?.rows;
+          if (rows && rows.length > 0) {
+            newRecords = [];
+            for (const row of rows) {
+              const dateStr = row[0]?.substring(0, 10);
+              const sst = row[3];
+              if (dateStr && sst != null && !isNaN(sst)) {
+                newRecords.push(toRecord(dateStr, Math.round(sst * 10) / 10));
+              }
+            }
+            console.log(`  ERDDAP JSON returned ${newRecords.length} records (via ${new URL(mirror).hostname})`);
+            break outer2;
+          }
+        } catch (je) {
+          console.log(`  ERDDAP JSON failed (${new URL(mirror).hostname}): ${je.message}`);
         }
-      } catch (je) {
-        console.log(`  ERDDAP JSON failed for ${tryStart}: ${je.message}`);
       }
     }
   }
