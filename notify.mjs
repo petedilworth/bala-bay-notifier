@@ -60,11 +60,11 @@ const FLOW_STATIONS = [
 // Bala Bay coordinates for satellite SST lookup
 const BALA_LAT = 45.01;
 const BALA_LON = -79.6;
-const ERDDAP_BASE = 'https://coastwatch.pfeg.noaa.gov/erddap/griddap';
+const ERDDAP_BASE = 'https://polarwatch.noaa.gov/erddap/griddap';
 const ERDDAP_MIRRORS = [
-  'https://upwell.pfeg.noaa.gov/erddap/griddap',
-  'https://coastwatch.pfeg.noaa.gov/erddap/griddap',
-  'https://erddap.marine.usf.edu/erddap/griddap',
+  'https://polarwatch.noaa.gov/erddap/griddap',
+  'https://erddap.emodnet.eu/erddap/griddap',
+  'https://erddap.riddc.brown.edu/erddap/griddap',
 ];
 
 // ── Configuration (from environment variables) ──
@@ -260,11 +260,7 @@ async function fetchHistoricalWaterTemp() {
 
   const endTs = `${endDate}T09:00:00Z`;
 
-  // Try shortest ranges first so we get data fast (full range last — it can timeout)
-  const fallbackStarts = ['2024-01-01', '2022-01-01', '2018-01-01', '2010-01-01', '2002-06-01'];
-  const startDates = latestCached
-    ? [`${startDate}`]
-    : fallbackStarts;
+  const startDates = [latestCached ? `${startDate}` : '2024-01-01'];
 
   let newRecords = null;
 
@@ -294,7 +290,7 @@ async function fetchHistoricalWaterTemp() {
 
   // JSON fallback across all mirrors
   if (!newRecords || newRecords.length === 0) {
-    const jsonStarts = latestCached ? [`${startDate}`] : ['2024-01-01', '2022-01-01'];
+    const jsonStarts = [latestCached ? `${startDate}` : '2024-01-01'];
     outer2:
     for (const tryStart of jsonStarts) {
       const ts = `${tryStart}T09:00:00Z`;
