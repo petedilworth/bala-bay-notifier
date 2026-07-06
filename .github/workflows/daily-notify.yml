@@ -3,16 +3,21 @@ name: Daily Bala Bay Water Level
 on:
   schedule:
     # Run daily at 7:00 AM Eastern Time
-    # GitHub Actions uses UTC, so 7am ET = 12:00 UTC (EST) or 11:00 UTC (EDT)
-    # Using 11:00 UTC to cover EDT (summer), which means 7am in summer, 6am in winter
+    # GitHub Actions uses UTC, so 11:00 UTC = 7am EDT (summer, UTC-4)
+    # In winter (EST, UTC-5) this fires at 6am — acceptable trade-off
     - cron: '0 11 * * *'
 
   # Allow manual trigger for testing
   workflow_dispatch:
 
+concurrency:
+  group: daily-notify
+  cancel-in-progress: true
+
 jobs:
   notify:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -23,12 +28,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
 
       - name: Install canvas system dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Send water level notification
         env:
@@ -38,7 +44,7 @@ jobs:
         run: node notify.mjs
 
       - name: Save updated data
-        if: always()
+        if: success()
         run: |
           if [ ! -d data ]; then
             echo "No data directory — skipping commit"

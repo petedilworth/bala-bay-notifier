@@ -15,7 +15,7 @@ const TEMP_CSV_PATH = __dirname + 'data/water-temp.csv';
  *
  * Data sources:
  *   MSC GeoMet OGC API (api.weather.gc.ca) — water levels
- *   NOAA ERDDAP MUR SST (coastwatch.pfeg.noaa.gov) — water temperature
+ *   NOAA ERDDAP MUR SST (polarwatch.noaa.gov) — water temperature
  * Station: 02EB015 — Bala Bay at Bala (Lake Muskoka)
  */
 
@@ -29,7 +29,7 @@ const CURRENT_YEAR = parseInt(TODAY_ISO.substring(0, 4));
 const LOW_WATER_START = `${CURRENT_YEAR}-01-01`;
 const LOW_WATER_END = TODAY_ISO;
 // Daily-mean history fetched per station (used for July average, low water,
-// 60-day chart backfill, and the CSV attachment).
+// and 60-day chart backfill).
 const HISTORY_START = `${CURRENT_YEAR - 5}-01-01`;
 const HISTORY_END = TODAY_ISO;
 
@@ -60,12 +60,21 @@ const FLOW_STATIONS = [
 // Bala Bay coordinates for satellite SST lookup
 const BALA_LAT = 45.01;
 const BALA_LON = -79.6;
-const ERDDAP_BASE = 'https://polarwatch.noaa.gov/erddap/griddap';
 const ERDDAP_MIRRORS = [
   'https://polarwatch.noaa.gov/erddap/griddap',
   'https://erddap.emodnet.eu/erddap/griddap',
   'https://erddap.riddc.brown.edu/erddap/griddap',
 ];
+
+// ── Tunable constants ──
+const CM_PER_INCH = 2.54;
+const CHART_DAYS = 60;
+const CHART_HEIGHT_PX = 120;
+const CHART_MIN_BAR_PX = 3;
+const CHART_MIN_RANGE = 0.01;
+const ERDDAP_TIMEOUT_MS = 20000;
+const OGC_TIMEOUT_MS = 15000;
+const OUTLIER_THRESHOLD_M = 0.5;
 
 // ── Configuration (from environment variables) ──
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
@@ -75,7 +84,7 @@ const EMAIL_FROM = process.env.EMAIL_FROM || 'Bala Bay <onboarding@resend.dev>';
 // ── Fetch helpers ──
 
 async function fetchJSON(url) {
-  const resp = await fetch(url);
+  const resp = await fetch(url, { signal: AbortSignal.timeout(OGC_TIMEOUT_MS) });
   if (!resp.ok) throw new Error(`HTTP ${resp.status} from ${url}`);
   return resp.json();
 }
@@ -95,54 +104,28 @@ async function fetchAllFeatures(buildUrl, maxPages = 20) {
 
 // ── Parsers ──
 
-function parseRealtimeFeatures(features) {
+function parseRealtime(features, field) {
   const dayMap = {};
   for (const f of features) {
     const p = f.properties || {};
-    if (p.LEVEL == null) continue;
+    if (p[field] == null) continue;
     const d = (p.DATETIME || '').substring(0, 10);
     if (!d) continue;
     if (!dayMap[d]) dayMap[d] = [];
-    dayMap[d].push(p.LEVEL);
+    dayMap[d].push(p[field]);
   }
   return Object.entries(dayMap)
     .map(([date, v]) => ({ date, value: v.reduce((a, b) => a + b, 0) / v.length }))
     .sort((a, b) => a.date.localeCompare(b.date));
 }
 
-function parseDailyFeatures(features) {
+function parseDaily(features, field) {
   const results = [];
   for (const f of features) {
     const p = f.properties || {};
-    if (p.LEVEL == null) continue;
+    if (p[field] == null) continue;
     const date = (p.DATE || '').substring(0, 10);
-    if (date) results.push({ date, value: p.LEVEL });
-  }
-  return results.sort((a, b) => a.date.localeCompare(b.date));
-}
-
-function parseRealtimeDischarge(features) {
-  const dayMap = {};
-  for (const f of features) {
-    const p = f.properties || {};
-    if (p.DISCHARGE == null) continue;
-    const d = (p.DATETIME || '').substring(0, 10);
-    if (!d) continue;
-    if (!dayMap[d]) dayMap[d] = [];
-    dayMap[d].push(p.DISCHARGE);
-  }
-  return Object.entries(dayMap)
-    .map(([date, v]) => ({ date, value: v.reduce((a, b) => a + b, 0) / v.length }))
-    .sort((a, b) => a.date.localeCompare(b.date));
-}
-
-function parseDailyDischarge(features) {
-  const results = [];
-  for (const f of features) {
-    const p = f.properties || {};
-    if (p.DISCHARGE == null) continue;
-    const date = (p.DATE || '').substring(0, 10);
-    if (date) results.push({ date, value: p.DISCHARGE });
+    if (date) results.push({ date, value: p[field] });
   }
   return results.sort((a, b) => a.date.localeCompare(b.date));
 }
@@ -154,7 +137,7 @@ function filterOutliers(data) {
   const clean = [data[0]];
   for (let i = 1; i < data.length - 1; i++) {
     const avg = (data[i - 1].value + data[i + 1].value) / 2;
-    if (Math.abs(data[i].value - avg) > 0.5) {
+    if (Math.abs(data[i].value - avg) > OUTLIER_THRESHOLD_M) {
       console.log(`  Outlier removed: ${data[i].date} = ${data[i].value}m`);
       continue;
     }
@@ -168,24 +151,27 @@ function filterOutliers(data) {
 
 async function fetchWaterTemp() {
   // MUR SST: 0.01° resolution global SST analysis, updated daily
-  // Uses "last" to get most recent available data point
-  const url = `${ERDDAP_BASE}/jplMURSST41.json?analysed_sst[(last)][(${BALA_LAT})][(${BALA_LON})]`;
-  try {
-    const resp = await fetch(url);
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    const rows = data?.table?.rows;
-    if (!rows || rows.length === 0) return null;
-    // Row format: [time, latitude, longitude, analysed_sst]
-    const sst = rows[0][3];
-    if (sst == null) return null; // land-masked or missing
-    const time = rows[0][0];
-    const date = time ? time.substring(0, 10) : null;
-    return { tempC: Math.round(sst * 10) / 10, date };
-  } catch (e) {
-    console.log(`  Water temp fetch failed: ${e.message}`);
-    return null;
+  // Uses "(last)" to get most recent available data point — tries each mirror in order
+  for (const mirror of ERDDAP_MIRRORS) {
+    const url = `${mirror}/jplMURSST41.json?analysed_sst[(last)][(${BALA_LAT})][(${BALA_LON})]`;
+    try {
+      const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
+      if (!resp.ok) continue;
+      const data = await resp.json();
+      const rows = data?.table?.rows;
+      if (!rows || rows.length === 0) continue;
+      // Row format: [time, latitude, longitude, analysed_sst]
+      const sst = rows[0][3];
+      if (sst == null) continue; // land-masked or missing
+      const time = rows[0][0];
+      const date = time ? time.substring(0, 10) : null;
+      return { tempC: Math.round(sst * 10) / 10, date };
+    } catch (e) {
+      const { hostname } = new URL(mirror);
+      console.log(`  Water temp fetch failed (${hostname}): ${e.message}`);
+    }
   }
+  return null;
 }
 
 // ── Historical water temperature for spaghetti chart (MUR SST v4.1 starts 2002-06-01) ──
@@ -260,69 +246,61 @@ async function fetchHistoricalWaterTemp() {
 
   const endTs = `${endDate}T09:00:00Z`;
 
-  const startDates = [latestCached ? `${startDate}` : '2024-01-01'];
+  const tryStart = latestCached ? startDate : '2024-01-01';
+  const ts = `${tryStart}T09:00:00Z`;
 
   let newRecords = null;
 
-  // Try each date range across all mirrors before moving to next range
-  outer:
-  for (const tryStart of startDates) {
-    const ts = `${tryStart}T09:00:00Z`;
-    if (ts > endTs) continue;
-
+  // CSV — try each mirror in order
+  if (ts <= endTs) {
     for (const mirror of ERDDAP_MIRRORS) {
+      const { hostname } = new URL(mirror);
       const url = `${mirror}/jplMURSST41.csv?analysed_sst[(${ts}):(${endTs})][(${BALA_LAT})][(${BALA_LON})]`;
-      console.log(`  Trying ERDDAP CSV: ${tryStart} to ${endDate} via ${new URL(mirror).hostname} (20s timeout)...`);
+      console.log(`  Trying ERDDAP CSV: ${tryStart} to ${endDate} via ${hostname} (${ERDDAP_TIMEOUT_MS / 1000}s timeout)...`);
       try {
-        const resp = await fetch(url, { signal: AbortSignal.timeout(20000) });
+        const resp = await fetch(url, { signal: AbortSignal.timeout(ERDDAP_TIMEOUT_MS) });
         if (resp.ok) {
           newRecords = parseERDDAPCsv(await resp.text());
-          console.log(`  ERDDAP returned ${newRecords.length} records (from ${tryStart} via ${new URL(mirror).hostname})`);
-          break outer;
+          console.log(`  ERDDAP returned ${newRecords.length} records (from ${tryStart} via ${hostname})`);
+          break;
         }
         const errBody = await resp.text().catch(() => '');
         console.log(`  ERDDAP HTTP ${resp.status}: ${errBody.substring(0, 300)}`);
       } catch (e) {
-        console.log(`  ERDDAP CSV failed (${new URL(mirror).hostname}): ${e.message}`);
+        console.log(`  ERDDAP CSV failed (${hostname}): ${e.message}`);
       }
     }
   }
 
-  // JSON fallback across all mirrors
-  if (!newRecords || newRecords.length === 0) {
-    const jsonStarts = [latestCached ? `${startDate}` : '2024-01-01'];
-    outer2:
-    for (const tryStart of jsonStarts) {
-      const ts = `${tryStart}T09:00:00Z`;
-      if (ts > endTs) continue;
-
-      for (const mirror of ERDDAP_MIRRORS) {
-        const url = `${mirror}/jplMURSST41.json?analysed_sst[(${ts}):(${endTs})][(${BALA_LAT})][(${BALA_LON})]`;
-        console.log(`  Trying ERDDAP JSON: ${tryStart} to ${endDate} via ${new URL(mirror).hostname} (20s timeout)...`);
-        try {
-          const resp = await fetch(url, { signal: AbortSignal.timeout(20000) });
-          if (!resp.ok) {
-            const errBody = await resp.text().catch(() => '');
-            console.log(`  ERDDAP JSON HTTP ${resp.status}: ${errBody.substring(0, 300)}`);
-            continue;
-          }
-          const data = await resp.json();
-          const rows = data?.table?.rows;
-          if (rows && rows.length > 0) {
-            newRecords = [];
-            for (const row of rows) {
-              const dateStr = row[0]?.substring(0, 10);
-              const sst = row[3];
-              if (dateStr && sst != null && !isNaN(sst)) {
-                newRecords.push(toRecord(dateStr, Math.round(sst * 10) / 10));
-              }
-            }
-            console.log(`  ERDDAP JSON returned ${newRecords.length} records (via ${new URL(mirror).hostname})`);
-            break outer2;
-          }
-        } catch (je) {
-          console.log(`  ERDDAP JSON failed (${new URL(mirror).hostname}): ${je.message}`);
+  // JSON fallback — try each mirror in order
+  if ((!newRecords || newRecords.length === 0) && ts <= endTs) {
+    for (const mirror of ERDDAP_MIRRORS) {
+      const { hostname } = new URL(mirror);
+      const url = `${mirror}/jplMURSST41.json?analysed_sst[(${ts}):(${endTs})][(${BALA_LAT})][(${BALA_LON})]`;
+      console.log(`  Trying ERDDAP JSON: ${tryStart} to ${endDate} via ${hostname} (${ERDDAP_TIMEOUT_MS / 1000}s timeout)...`);
+      try {
+        const resp = await fetch(url, { signal: AbortSignal.timeout(ERDDAP_TIMEOUT_MS) });
+        if (!resp.ok) {
+          const errBody = await resp.text().catch(() => '');
+          console.log(`  ERDDAP JSON HTTP ${resp.status}: ${errBody.substring(0, 300)}`);
+          continue;
         }
+        const data = await resp.json();
+        const rows = data?.table?.rows;
+        if (rows && rows.length > 0) {
+          newRecords = [];
+          for (const row of rows) {
+            const dateStr = row[0]?.substring(0, 10);
+            const sst = row[3];
+            if (dateStr && sst != null && !isNaN(sst)) {
+              newRecords.push(toRecord(dateStr, Math.round(sst * 10) / 10));
+            }
+          }
+          console.log(`  ERDDAP JSON returned ${newRecords.length} records (via ${hostname})`);
+          break;
+        }
+      } catch (je) {
+        console.log(`  ERDDAP JSON failed (${hostname}): ${je.message}`);
       }
     }
   }
@@ -464,6 +442,199 @@ async function buildTempSpaghettiChart(records) {
   return buffer;
 }
 
+// ── Shared chart helpers ──
+
+function fmtShort(d) {
+  return new Date(d.date + 'T12:00:00').toLocaleDateString('en-CA', { month: 'short', day: 'numeric' });
+}
+
+function buildWaterLevelChart(name, label, days, stJulyAvg, isFirst, stationId) {
+  if (!days || days.length === 0) return null;
+  const chartDays = days.slice(-CHART_DAYS);
+  const hwm = stationId ? HIGH_WATER_MARKS[stationId] : null;
+
+  const latest = chartDays[chartDays.length - 1];
+  const vsJulyStr = stJulyAvg !== null
+    ? (() => {
+        const diffIn = (latest.value - stJulyAvg) * 100 / CM_PER_INCH;
+        return ` · ${diffIn >= 0 ? '+' : ''}${diffIn.toFixed(1)}in vs Jul avg`;
+      })()
+    : '';
+
+  const minVal = Math.min(...chartDays.map(d => d.value), stJulyAvg ?? Infinity, hwm ? hwm.level : Infinity);
+  const maxVal = Math.max(...chartDays.map(d => d.value), stJulyAvg ?? -Infinity, hwm ? hwm.level : -Infinity);
+  const range = maxVal - minVal || CHART_MIN_RANGE;
+
+  const firstDate = chartDays[0];
+  const midDate = chartDays[Math.floor(chartDays.length / 2)];
+  const lastDate = chartDays[chartDays.length - 1];
+
+  const bars = chartDays.map((d, i) => {
+    const pct = (d.value - minVal) / range;
+    const height = Math.max(CHART_MIN_BAR_PX, Math.round(pct * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
+    const color = i === chartDays.length - 1 ? '#E07B4C' : '#4A9BD9';
+    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:6px;height:${height}px;background:${color};border-radius:1px;"></div></td>`;
+  }).join('');
+
+  let refLines = '';
+  if (stJulyAvg !== null) {
+    const refPx = Math.max(1, Math.round(((stJulyAvg - minVal) / range) * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
+    refLines += `<div style="margin-top:-${refPx}px;border-top:1px dashed #5BA88A;height:0;margin-bottom:${refPx - 1}px;"></div>`;
+  }
+  if (hwm) {
+    const refPx = Math.max(1, Math.round(((hwm.level - minVal) / range) * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
+    refLines += `<div style="margin-top:-${refPx}px;border-top:1px dashed #C0392B;height:0;margin-bottom:${refPx - 1}px;"></div>`;
+  }
+
+  const sectionStyle = isFirst
+    ? 'margin-top:12px;'
+    : 'margin-top:20px;border-top:1px solid #E0DAD2;padding-top:16px;';
+
+  const legendItems = [
+    '<span style="display:inline-block;width:8px;height:8px;background:#4A9BD9;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Daily level',
+    '<span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Today',
+  ];
+  if (stJulyAvg !== null) {
+    legendItems.push('<span style="display:inline-block;width:12px;border-top:1px dashed #5BA88A;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Jul avg');
+  }
+  if (hwm) {
+    legendItems.push(`<span style="display:inline-block;width:12px;border-top:1px dashed #C0392B;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>${hwm.year} high`);
+  }
+
+  const html = `
+      <div style="${sectionStyle}">
+        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:2px;">${name} — ${label}</div>
+        <div style="font-size:9px;color:#999;margin-bottom:8px;">Water Level — Last ${chartDays.length} Days${vsJulyStr}</div>
+        <div style="display:inline-block;">
+          <div style="border-bottom:1px solid #E0DAD2;padding-left:2px;">
+            <table style="border-collapse:collapse;height:${CHART_HEIGHT_PX}px;"><tr>${bars}</tr></table>
+            ${refLines}
+          </div>
+          <table style="width:100%;border-collapse:collapse;margin-top:2px;"><tr>
+            <td style="font-size:9px;color:#999;text-align:left;padding:0;">${fmtShort(firstDate)}</td>
+            <td style="font-size:9px;color:#999;text-align:center;padding:0;">${fmtShort(midDate)}</td>
+            <td style="font-size:9px;color:#6B6B6B;text-align:right;font-weight:600;padding:0;">${fmtShort(lastDate)}</td>
+          </tr></table>
+        </div>
+        <div style="margin-top:6px;font-size:9px;color:#999;">${legendItems.join('\n          ')}</div>
+      </div>`;
+
+  return { html };
+}
+
+function buildSpreadChart(balaDays, balaJulyAvg, beauDays, beauJulyAvg) {
+  if (!balaDays || !beauDays || balaJulyAvg === null || beauJulyAvg === null) return null;
+
+  const balaByDate = new Map(balaDays.map(d => [d.date, d.value]));
+  const spreadDays = [];
+  for (const d of beauDays) {
+    const balaVal = balaByDate.get(d.date);
+    if (balaVal === undefined) continue;
+    const spreadIn = ((d.value - beauJulyAvg) - (balaVal - balaJulyAvg)) * 100 / CM_PER_INCH;
+    spreadDays.push({ date: d.date, spread: spreadIn });
+  }
+  if (spreadDays.length === 0) return null;
+
+  const chartDays = spreadDays.slice(-CHART_DAYS);
+  const latestSpread = chartDays[chartDays.length - 1].spread;
+
+  const values = chartDays.map(d => d.spread);
+  const minVal = Math.min(...values, 0) - 0.5;
+  const maxVal = Math.max(...values, 0) + 0.5;
+  const range = maxVal - minVal || CHART_MIN_RANGE;
+
+  const firstDate = chartDays[0];
+  const midDate = chartDays[Math.floor(chartDays.length / 2)];
+  const lastDate = chartDays[chartDays.length - 1];
+
+  const bars = chartDays.map((d) => {
+    const pct = (d.spread - minVal) / range;
+    const height = Math.max(CHART_MIN_BAR_PX, Math.round(pct * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
+    const color = d.spread >= 0 ? '#4A9BD9' : '#E07B4C';
+    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:6px;height:${height}px;background:${color};border-radius:1px;"></div></td>`;
+  }).join('');
+
+  const zeroPx = Math.max(1, Math.round(((0 - minVal) / range) * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
+  const zeroLine = `<div style="margin-top:-${zeroPx}px;border-top:1px solid #666;height:0;margin-bottom:${zeroPx - 1}px;"></div>`;
+
+  const html = `
+      <div style="margin-top:20px;border-top:1px solid #E0DAD2;padding-top:16px;">
+        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:2px;">Beaumaris vs Bala — Water Level Spread</div>
+        <div style="font-size:9px;color:#999;margin-bottom:8px;">Last ${chartDays.length} Days · Current: ${latestSpread >= 0 ? '+' : ''}${latestSpread.toFixed(1)}in</div>
+        <div style="display:inline-block;">
+          <div style="border-bottom:1px solid #E0DAD2;padding-left:2px;">
+            <table style="border-collapse:collapse;height:${CHART_HEIGHT_PX}px;"><tr>${bars}</tr></table>
+            ${zeroLine}
+          </div>
+          <table style="width:100%;border-collapse:collapse;margin-top:2px;"><tr>
+            <td style="font-size:9px;color:#999;text-align:left;padding:0;">${fmtShort(firstDate)}</td>
+            <td style="font-size:9px;color:#999;text-align:center;padding:0;">${fmtShort(midDate)}</td>
+            <td style="font-size:9px;color:#6B6B6B;text-align:right;font-weight:600;padding:0;">${fmtShort(lastDate)}</td>
+          </tr></table>
+        </div>
+        <div style="margin-top:4px;font-size:9px;color:#999;">
+          <span style="display:inline-block;width:8px;height:8px;background:#4A9BD9;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Beaumaris above Bala
+          <span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Bala above Beaumaris
+        </div>
+        <div style="font-size:8px;color:#BBB;margin-top:2px;">Normalized to each station’s 5-year July average (inches)</div>
+      </div>`;
+
+  return { html };
+}
+
+function buildFlowChart(name, label, days, isFirst) {
+  if (!days || days.length === 0) return '';
+  const chartDays = days.slice(-CHART_DAYS);
+  const minVal = Math.min(...chartDays.map(d => d.value));
+  const maxVal = Math.max(...chartDays.map(d => d.value));
+  const range = maxVal - minVal || CHART_MIN_RANGE;
+
+  const bars = chartDays.map((d, i) => {
+    const pct = (d.value - minVal) / range;
+    const height = Math.max(CHART_MIN_BAR_PX, Math.round(pct * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
+    const color = i === chartDays.length - 1 ? '#E07B4C' : '#6B8EAD';
+    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:6px;height:${height}px;background:${color};border-radius:1px;" title="${d.date}: ${d.value.toFixed(1)} m³/s"></div></td>`;
+  }).join('');
+
+  const firstDate = chartDays[0];
+  const midDate = chartDays[Math.floor(chartDays.length / 2)];
+  const lastDate = chartDays[chartDays.length - 1];
+  const latest = chartDays[chartDays.length - 1];
+
+  const sectionStyle = isFirst
+    ? 'margin-top:12px;'
+    : 'margin-top:20px;border-top:1px solid #E0DAD2;padding-top:16px;';
+
+  return `
+      <div style="${sectionStyle}">
+        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:2px;">${name} — ${label}</div>
+        <div style="font-size:9px;color:#999;margin-bottom:8px;">Flow Rate — Last ${chartDays.length} Days · ${latest.value.toFixed(1)} m³/s</div>
+        <div style="display:inline-block;">
+          <div style="position:relative;border-bottom:1px solid #E0DAD2;padding-left:2px;">
+            <table style="border-collapse:collapse;height:${CHART_HEIGHT_PX}px;"><tr>${bars}</tr></table>
+          </div>
+          <table style="width:100%;border-collapse:collapse;margin-top:2px;"><tr>
+            <td style="font-size:9px;color:#999;text-align:left;padding:0;">${fmtShort(firstDate)}</td>
+            <td style="font-size:9px;color:#999;text-align:center;padding:0;">${fmtShort(midDate)}</td>
+            <td style="font-size:9px;color:#6B6B6B;text-align:right;font-weight:600;padding:0;">${fmtShort(lastDate)}</td>
+          </tr></table>
+        </div>
+        <div style="margin-top:6px;font-size:9px;color:#999;">
+          <span style="display:inline-block;width:8px;height:8px;background:#6B8EAD;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Daily flow
+          <span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Today
+        </div>
+      </div>`;
+}
+
+function txtRow(name, label, recentDays, stJulyAvg, lowWater) {
+  if (!recentDays || recentDays.length === 0) return null;
+  const lat = recentDays[recentDays.length - 1];
+  const aboveLow = lowWater ? ((lat.value - lowWater.value) * 100 / CM_PER_INCH).toFixed(1) : '?';
+  const belowSum = stJulyAvg !== null ? ((lat.value - stJulyAvg) * 100 / CM_PER_INCH).toFixed(1) : '?';
+  return `  ${name} (${label}): ${lat.value.toFixed(3)}m | ↑low:${aboveLow}in | ↓summer:${belowSum}in`;
+}
+
+
 // ── Fetch all data for a station: realtime + 5-year daily-mean history, then
 //    derive July avg, low water, and a combined daily series used for the
 //    chart, day-change metrics, and the CSV attachment. ──
@@ -483,7 +654,7 @@ async function fetchStationData(stationId) {
       (lim, off) => `${API_BASE}/hydrometric-realtime/items?f=json&STATION_NUMBER=${stationId}&limit=${lim}&offset=${off}`,
       20
     );
-    result.realtimeDaily = filterOutliers(parseRealtimeFeatures(rtFeats));
+    result.realtimeDaily = filterOutliers(parseRealtime(rtFeats, 'LEVEL'));
   } catch (e) {
     console.log(`    Realtime failed: ${e.message}`);
   }
@@ -495,7 +666,7 @@ async function fetchStationData(stationId) {
       (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${stationId}&datetime=${HISTORY_START}/${HISTORY_END}&limit=${lim}&offset=${off}`,
       20
     );
-    result.history = parseDailyFeatures(feats);
+    result.history = parseDaily(feats, 'LEVEL');
   } catch (e) {
     console.log(`    Daily-mean history failed: ${e.message}`);
   }
@@ -538,7 +709,7 @@ async function fetchFlowData(stationId) {
     );
     const withDischarge = rtFeats.filter(f => f.properties?.DISCHARGE != null).length;
     console.log(`    realtime: ${rtFeats.length} features, ${withDischarge} with DISCHARGE`);
-    result.realtimeDaily = parseRealtimeDischarge(rtFeats);
+    result.realtimeDaily = parseRealtime(rtFeats, 'DISCHARGE');
   } catch (e) {
     console.log(`    Realtime flow failed: ${e.message}`);
   }
@@ -552,7 +723,7 @@ async function fetchFlowData(stationId) {
     );
     const withDischarge = feats.filter(f => f.properties?.DISCHARGE != null).length;
     console.log(`    daily-mean: ${feats.length} features, ${withDischarge} with DISCHARGE`);
-    result.history = parseDailyDischarge(feats);
+    result.history = parseDaily(feats, 'DISCHARGE');
   } catch (e) {
     console.log(`    Daily-mean flow failed: ${e.message}`);
   }
@@ -595,7 +766,7 @@ async function main() {
   if (recentData.length >= 7) {
     const weekAgo = recentData[recentData.length - 7];
     trend = (latest.value - weekAgo.value) * 100; // in cm
-    trendIn = trend / 2.54; // in inches
+    trendIn = trend / CM_PER_INCH; // in inches
     trendArrow = trend > 0.5 ? '↗ rising' : trend < -0.5 ? '↘ falling' : '→ stable';
     console.log(`  7-day trend: ${trendIn > 0 ? '+' : ''}${trendIn.toFixed(1)}in (${trendArrow})`);
   }
@@ -618,7 +789,7 @@ async function main() {
   }
 
   // Convert delta and values to inches relative to July average
-  const deltaIn = deltaCm !== null ? deltaCm / 2.54 : null;
+  const deltaIn = deltaCm !== null ? deltaCm / CM_PER_INCH : null;
 
   // 4. Fetch water temperature: current + historical for spaghetti chart
   console.log('Fetching water temperature (current + historical)...');
@@ -626,8 +797,9 @@ async function main() {
     fetchWaterTemp(),
     fetchHistoricalWaterTemp(),
   ]);
+  const tempF = waterTemp ? Math.round(waterTemp.tempC * 9 / 5 + 32) : null;
   if (waterTemp) {
-    console.log(`  Water temp: ${waterTemp.tempC}°C (${(waterTemp.tempC * 9/5 + 32).toFixed(0)}°F) — ${waterTemp.date}`);
+    console.log(`  Water temp: ${waterTemp.tempC}°C (${tempF}°F) — ${waterTemp.date}`);
   } else {
     console.log('  Water temperature unavailable');
   }
@@ -684,9 +856,9 @@ async function main() {
       if (!days || days.length === 0) return;
       const lat = days[days.length - 1];
       const level = lat.value;
-      const aboveLow = lowWater ? ((level - lowWater.value) * 100 / 2.54).toFixed(2) : '';
-      const belowSum = stJulyAvg !== null ? ((level - stJulyAvg) * 100 / 2.54).toFixed(2) : '';
-      const chg = (n) => days.length > n ? (((level - days[days.length - 1 - n].value) * 100 / 2.54).toFixed(2)) : '';
+      const aboveLow = lowWater ? ((level - lowWater.value) * 100 / CM_PER_INCH).toFixed(2) : '';
+      const belowSum = stJulyAvg !== null ? ((level - stJulyAvg) * 100 / CM_PER_INCH).toFixed(2) : '';
+      const chg = (n) => days.length > n ? (((level - days[days.length - 1 - n].value) * 100 / CM_PER_INCH).toFixed(2)) : '';
       csvRows.push([name, label, lat.date, level.toFixed(4), stJulyAvg?.toFixed(4) ?? '', lowWater?.date ?? '', lowWater?.value.toFixed(4) ?? '', aboveLow, belowSum, chg(1), chg(2), chg(3)].join(','));
     }
     csvRow('Bala', 'Lake Muskoka', recentData, julyAvg, balaLowWater);
@@ -741,194 +913,6 @@ async function main() {
     console.log(`  Spread chart failed: ${e.message}`);
   }
 
-  // Water level chart builder: 60-day HTML bar chart with reference lines.
-  function buildWaterLevelChart(name, label, days, stJulyAvg, isFirst, stationId) {
-    if (!days || days.length === 0) return null;
-    const chartDays = days.slice(-60);
-    const hwm = stationId ? HIGH_WATER_MARKS[stationId] : null;
-    const chartHeight = 120;
-
-    const latest = chartDays[chartDays.length - 1];
-    const vsJulyStr = stJulyAvg !== null
-      ? (() => {
-          const diffIn = (latest.value - stJulyAvg) * 100 / 2.54;
-          return ` \u00b7 ${diffIn >= 0 ? '+' : ''}${diffIn.toFixed(1)}in vs Jul avg`;
-        })()
-      : '';
-
-    const minVal = Math.min(...chartDays.map(d => d.value), stJulyAvg ?? Infinity, hwm ? hwm.level : Infinity);
-    const maxVal = Math.max(...chartDays.map(d => d.value), stJulyAvg ?? -Infinity, hwm ? hwm.level : -Infinity);
-    const range = maxVal - minVal || 0.01;
-
-    const fmtShort = (d) => new Date(d.date + 'T12:00:00').toLocaleDateString('en-CA', { month: 'short', day: 'numeric' });
-    const firstDate = chartDays[0];
-    const midDate = chartDays[Math.floor(chartDays.length / 2)];
-    const lastDate = chartDays[chartDays.length - 1];
-
-    const bars = chartDays.map((d, i) => {
-      const pct = (d.value - minVal) / range;
-      const height = Math.max(3, Math.round(pct * (chartHeight - 10) + 3));
-      const color = i === chartDays.length - 1 ? '#E07B4C' : '#4A9BD9';
-      return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:6px;height:${height}px;background:${color};border-radius:1px;"></div></td>`;
-    }).join('');
-
-    let refLines = '';
-    if (stJulyAvg !== null) {
-      const refPx = Math.max(1, Math.round(((stJulyAvg - minVal) / range) * (chartHeight - 10) + 3));
-      refLines += `<div style="margin-top:-${refPx}px;border-top:1px dashed #5BA88A;height:0;margin-bottom:${refPx - 1}px;"></div>`;
-    }
-    if (hwm) {
-      const refPx = Math.max(1, Math.round(((hwm.level - minVal) / range) * (chartHeight - 10) + 3));
-      refLines += `<div style="margin-top:-${refPx}px;border-top:1px dashed #C0392B;height:0;margin-bottom:${refPx - 1}px;"></div>`;
-    }
-
-    const sectionStyle = isFirst
-      ? 'margin-top:12px;'
-      : 'margin-top:20px;border-top:1px solid #E0DAD2;padding-top:16px;';
-
-    const legendItems = [
-      '<span style="display:inline-block;width:8px;height:8px;background:#4A9BD9;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Daily level',
-      '<span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Today',
-    ];
-    if (stJulyAvg !== null) {
-      legendItems.push('<span style="display:inline-block;width:12px;border-top:1px dashed #5BA88A;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Jul avg');
-    }
-    if (hwm) {
-      legendItems.push(`<span style="display:inline-block;width:12px;border-top:1px dashed #C0392B;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>${hwm.year} high`);
-    }
-
-    const html = `
-      <div style="${sectionStyle}">
-        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:2px;">${name} \u2014 ${label}</div>
-        <div style="font-size:9px;color:#999;margin-bottom:8px;">Water Level \u2014 Last ${chartDays.length} Days${vsJulyStr}</div>
-        <div style="display:inline-block;">
-          <div style="border-bottom:1px solid #E0DAD2;padding-left:2px;">
-            <table style="border-collapse:collapse;height:${chartHeight}px;"><tr>${bars}</tr></table>
-            ${refLines}
-          </div>
-          <table style="width:100%;border-collapse:collapse;margin-top:2px;"><tr>
-            <td style="font-size:9px;color:#999;text-align:left;padding:0;">${fmtShort(firstDate)}</td>
-            <td style="font-size:9px;color:#999;text-align:center;padding:0;">${fmtShort(midDate)}</td>
-            <td style="font-size:9px;color:#6B6B6B;text-align:right;font-weight:600;padding:0;">${fmtShort(lastDate)}</td>
-          </tr></table>
-        </div>
-        <div style="margin-top:6px;font-size:9px;color:#999;">${legendItems.join('\n          ')}</div>
-      </div>`;
-
-    return { html };
-  }
-
-  // Spread chart: Beaumaris vs Bala water level difference (normalized to July avg)
-  function buildSpreadChart(balaDays, balaJulyAvg, beauDays, beauJulyAvg) {
-    if (!balaDays || !beauDays || balaJulyAvg === null || beauJulyAvg === null) return null;
-
-    const balaByDate = new Map(balaDays.map(d => [d.date, d.value]));
-    const spreadDays = [];
-    for (const d of beauDays) {
-      const balaVal = balaByDate.get(d.date);
-      if (balaVal === undefined) continue;
-      const spreadIn = ((d.value - beauJulyAvg) - (balaVal - balaJulyAvg)) * 100 / 2.54;
-      spreadDays.push({ date: d.date, spread: spreadIn });
-    }
-    if (spreadDays.length === 0) return null;
-
-    const chartDays = spreadDays.slice(-60);
-    const chartHeight = 120;
-    const fmtShort = (d) => new Date(d.date + 'T12:00:00').toLocaleDateString('en-CA', { month: 'short', day: 'numeric' });
-    const latestSpread = chartDays[chartDays.length - 1].spread;
-
-    const values = chartDays.map(d => d.spread);
-    const minVal = Math.min(...values, 0) - 0.5;
-    const maxVal = Math.max(...values, 0) + 0.5;
-    const range = maxVal - minVal || 0.01;
-
-    const firstDate = chartDays[0];
-    const midDate = chartDays[Math.floor(chartDays.length / 2)];
-    const lastDate = chartDays[chartDays.length - 1];
-
-    const bars = chartDays.map((d) => {
-      const pct = (d.spread - minVal) / range;
-      const height = Math.max(3, Math.round(pct * (chartHeight - 10) + 3));
-      const color = d.spread >= 0 ? '#4A9BD9' : '#E07B4C';
-      return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:6px;height:${height}px;background:${color};border-radius:1px;"></div></td>`;
-    }).join('');
-
-    const zeroPx = Math.max(1, Math.round(((0 - minVal) / range) * (chartHeight - 10) + 3));
-    const zeroLine = `<div style="margin-top:-${zeroPx}px;border-top:1px solid #666;height:0;margin-bottom:${zeroPx - 1}px;"></div>`;
-
-    const html = `
-      <div style="margin-top:20px;border-top:1px solid #E0DAD2;padding-top:16px;">
-        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:2px;">Beaumaris vs Bala \u2014 Water Level Spread</div>
-        <div style="font-size:9px;color:#999;margin-bottom:8px;">Last ${chartDays.length} Days \u00b7 Current: ${latestSpread >= 0 ? '+' : ''}${latestSpread.toFixed(1)}in</div>
-        <div style="display:inline-block;">
-          <div style="border-bottom:1px solid #E0DAD2;padding-left:2px;">
-            <table style="border-collapse:collapse;height:${chartHeight}px;"><tr>${bars}</tr></table>
-            ${zeroLine}
-          </div>
-          <table style="width:100%;border-collapse:collapse;margin-top:2px;"><tr>
-            <td style="font-size:9px;color:#999;text-align:left;padding:0;">${fmtShort(firstDate)}</td>
-            <td style="font-size:9px;color:#999;text-align:center;padding:0;">${fmtShort(midDate)}</td>
-            <td style="font-size:9px;color:#6B6B6B;text-align:right;font-weight:600;padding:0;">${fmtShort(lastDate)}</td>
-          </tr></table>
-        </div>
-        <div style="margin-top:4px;font-size:9px;color:#999;">
-          <span style="display:inline-block;width:8px;height:8px;background:#4A9BD9;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Beaumaris above Bala
-          <span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Bala above Beaumaris
-        </div>
-        <div style="font-size:8px;color:#BBB;margin-top:2px;">Normalized to each station\u2019s 5-year July average (inches)</div>
-      </div>`;
-
-    return { html };
-  }
-
-  // Flow rate chart builder: 60-day bar chart for discharge (m³/s).
-  function buildFlowChart(name, label, days, isFirst) {
-    if (!days || days.length === 0) return '';
-    const chartDays = days.slice(-60);
-    const minVal = Math.min(...chartDays.map(d => d.value));
-    const maxVal = Math.max(...chartDays.map(d => d.value));
-    const range = maxVal - minVal || 0.01;
-    const chartHeight = 120; // px
-
-    const bars = chartDays.map((d, i) => {
-      const pct = (d.value - minVal) / range;
-      const height = Math.max(3, Math.round(pct * (chartHeight - 10) + 3));
-      const color = i === chartDays.length - 1 ? '#E07B4C' : '#6B8EAD';
-      return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:6px;height:${height}px;background:${color};border-radius:1px;" title="${d.date}: ${d.value.toFixed(1)} m³/s"></div></td>`;
-    }).join('');
-
-    const fmtShort = (d) => new Date(d.date + 'T12:00:00').toLocaleDateString('en-CA', { month: 'short', day: 'numeric' });
-    const firstDate = chartDays[0];
-    const midDate = chartDays[Math.floor(chartDays.length / 2)];
-    const lastDate = chartDays[chartDays.length - 1];
-
-    const latest = chartDays[chartDays.length - 1];
-
-    const sectionStyle = isFirst
-      ? 'margin-top:12px;'
-      : 'margin-top:20px;border-top:1px solid #E0DAD2;padding-top:16px;';
-
-    return `
-      <div style="${sectionStyle}">
-        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:2px;">${name} — ${label}</div>
-        <div style="font-size:9px;color:#999;margin-bottom:8px;">Flow Rate — Last ${chartDays.length} Days · ${latest.value.toFixed(1)} m³/s</div>
-        <div style="display:inline-block;">
-          <div style="position:relative;border-bottom:1px solid #E0DAD2;padding-left:2px;">
-            <table style="border-collapse:collapse;height:${chartHeight}px;"><tr>${bars}</tr></table>
-          </div>
-          <table style="width:100%;border-collapse:collapse;margin-top:2px;"><tr>
-            <td style="font-size:9px;color:#999;text-align:left;padding:0;">${fmtShort(firstDate)}</td>
-            <td style="font-size:9px;color:#999;text-align:center;padding:0;">${fmtShort(midDate)}</td>
-            <td style="font-size:9px;color:#6B6B6B;text-align:right;font-weight:600;padding:0;">${fmtShort(lastDate)}</td>
-          </tr></table>
-        </div>
-        <div style="margin-top:6px;font-size:9px;color:#999;">
-          <span style="display:inline-block;width:8px;height:8px;background:#6B8EAD;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Daily flow
-          <span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Today
-        </div>
-      </div>`;
-  }
-
   const deltaColor = deltaCm > 10 ? '#E07B4C'
     : deltaCm < -10 ? '#2D6A9F'
     : '#5BA88A';
@@ -945,17 +929,17 @@ async function main() {
       const lat = days[days.length - 1];
       const level = lat.value;
 
-      const belowSummer = stJulyAvg !== null ? ((level - stJulyAvg) * 100 / 2.54) : null;
+      const belowSummer = stJulyAvg !== null ? ((level - stJulyAvg) * 100 / CM_PER_INCH) : null;
       const belowSummerStr = belowSummer !== null ? (belowSummer >= 0 ? '+' : '') + belowSummer.toFixed(1) : '\u2014';
 
       const hwm = HIGH_WATER_MARKS[stationId];
-      const vsHigh = hwm ? ((level - hwm.level) * 100 / 2.54) : null;
+      const vsHigh = hwm ? ((level - hwm.level) * 100 / CM_PER_INCH) : null;
       const vsHighStr = vsHigh !== null ? (vsHigh >= 0 ? '+' : '') + vsHigh.toFixed(1) : '\u2014';
 
       function dayChange(n) {
         if (days.length <= n) return '\u2014';
         const prev = days[days.length - 1 - n];
-        const chg = (level - prev.value) * 100 / 2.54;
+        const chg = (level - prev.value) * 100 / CM_PER_INCH;
         return (chg >= 0 ? '+' : '') + chg.toFixed(1);
       }
 
@@ -1021,7 +1005,7 @@ async function main() {
       <!-- Water Temperature -->
       <div style="margin-bottom:16px;">
         <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:4px;">Water Temperature</div>
-        <div style="font-size:28px;font-weight:700;color:#0B1D33;">${waterTemp.tempC.toFixed(1)}<span style="font-size:14px;color:#6B6B6B;margin-left:2px;">°C</span> <span style="font-size:16px;font-weight:400;color:#6B6B6B;">(${(waterTemp.tempC * 9/5 + 32).toFixed(0)}°F)</span></div>
+        <div style="font-size:28px;font-weight:700;color:#0B1D33;">${waterTemp.tempC.toFixed(1)}<span style="font-size:14px;color:#6B6B6B;margin-left:2px;">°C</span> <span style="font-size:16px;font-weight:400;color:#6B6B6B;">(${tempF}°F)</span></div>
       </div>
       ` : ''}
 
@@ -1035,15 +1019,6 @@ async function main() {
           <span style="display:inline-block;width:16px;border-top:1px solid rgba(180,180,180,0.6);vertical-align:middle;margin-left:10px;margin-right:4px;"></span>2002\u2013${CURRENT_YEAR - 2}
         </div>
         <div style="font-size:8px;color:#BBB;margin-top:2px;">Source: NOAA MUR SST v4.1</div>
-      </div>
-      ` : ''}
-
-      ${julyAvg !== null ? `
-      <!-- Delta -->
-      <div style="background:#F8F6F2;border-radius:8px;padding:12px 16px;margin-bottom:16px;">
-        <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:4px;">vs 5-Year July Average</div>
-        <div style="font-size:24px;font-weight:700;color:${deltaColor};">${deltaSign}${deltaIn.toFixed(1)} in</div>
-        <div style="font-size:12px;color:#6B6B6B;margin-top:2px;">${deltaNote}</div>
       </div>
       ` : ''}
 
@@ -1084,14 +1059,6 @@ async function main() {
 </body>
 </html>`;
 
-  // Plain text fallback
-  function txtRow(name, label, recentDays, stJulyAvg, lowWater) {
-    if (!recentDays || recentDays.length === 0) return null;
-    const lat = recentDays[recentDays.length - 1];
-    const aboveLow = lowWater ? ((lat.value - lowWater.value) * 100 / 2.54).toFixed(1) : '?';
-    const belowSum = stJulyAvg !== null ? ((lat.value - stJulyAvg) * 100 / 2.54).toFixed(1) : '?';
-    return `  ${name} (${label}): ${lat.value.toFixed(3)}m | ↑low:${aboveLow}in | ↓summer:${belowSum}in`;
-  }
   const balaText = txtRow('Bala', 'Lake Muskoka', recentData, julyAvg, balaLowWater);
   const extraText = extraResults.filter(s => s.recentDays).map(s =>
     txtRow(s.name, s.label, s.recentDays, s.julyAvg, s.lowWater)
@@ -1106,7 +1073,7 @@ async function main() {
     `🌊 Bala Bay Water Level — ${dateStr}`,
     ``,
     `Current: ${deltaSign}${deltaIn?.toFixed(1) ?? '?'} in vs July avg`,
-    waterTemp ? `Water temp: ${waterTemp.tempC.toFixed(1)}°C (${(waterTemp.tempC * 9/5 + 32).toFixed(0)}°F)` : '',
+    waterTemp ? `Water temp: ${waterTemp.tempC.toFixed(1)}°C (${tempF}°F)` : '',
     julyAvg !== null ? `${deltaNote}` : '',
     trend !== null ? `7-day trend: ${trendIn > 0 ? '+' : ''}${trendIn.toFixed(1)} in ${trendArrow}` : '',
     ``,
@@ -1118,43 +1085,6 @@ async function main() {
     `Station 02EB015 · Lake Muskoka · Environment Canada${waterTemp ? ' · NOAA MUR SST' : ''}`,
   ].filter(Boolean).join('\n');
 
-  // Build CSV attachment: full 5+ year daily water level history for all 5 stations.
-  // Each row is (date, station, name, water_body, level_m, source) where source
-  // is "daily-mean" (authoritative historical value) or "realtime" (averaged from
-  // sub-daily readings, used to fill recent dates daily-mean hasn't published yet).
-  // Note: level_m is the raw LEVEL as reported by MSC — some stations report
-  // absolute elevation (e.g. Bala) while others report gauge height from a
-  // local datum, so values are NOT directly comparable across stations.
-  const csvLines = ['date,station_number,station_name,water_body,level_m,source'];
-  function appendStationRows(stationNumber, stationName, waterBody, history, realtimeDaily) {
-    const histDates = new Set((history || []).map(d => d.date));
-    for (const d of history || []) {
-      csvLines.push([d.date, stationNumber, stationName, waterBody, d.value.toFixed(4), 'daily-mean'].join(','));
-    }
-    for (const d of realtimeDaily || []) {
-      if (histDates.has(d.date)) continue; // already covered by daily-mean
-      csvLines.push([d.date, stationNumber, stationName, waterBody, d.value.toFixed(4), 'realtime'].join(','));
-    }
-  }
-  appendStationRows(STATION, 'Bala', 'Lake Muskoka', balaData.history, balaData.realtimeDaily);
-  for (const s of extraResults) {
-    appendStationRows(s.id, s.name, s.label, s.history, s.realtimeDaily);
-  }
-  // Sort rows by (station_number, date) for readability — header stays first.
-  const header = csvLines[0];
-  const rows = csvLines.slice(1).sort((a, b) => {
-    const ca = a.split(',');
-    const cb = b.split(',');
-    if (ca[1] !== cb[1]) return ca[1].localeCompare(cb[1]);
-    return ca[0].localeCompare(cb[0]);
-  });
-  const csvContent = [header, ...rows].join('\n') + '\n';
-  console.log(`  CSV: ${rows.length} rows, ${csvContent.length} bytes`);
-  const csvAttachment = {
-    filename: `water-levels-${latest.date}.csv`,
-    content: Buffer.from(csvContent, 'utf8').toString('base64'),
-  };
-
   // Send via Resend
   const emailResp = await fetch('https://api.resend.com/emails', {
     method: 'POST',
@@ -1165,16 +1095,9 @@ async function main() {
     body: JSON.stringify({
       from: EMAIL_FROM,
       to: EMAIL_TO,
-      subject: `🌊 Bala Bay: ${deltaSign}${deltaIn?.toFixed(1) ?? '?'} in vs July avg${waterTemp ? ` · ${waterTemp.tempC.toFixed(0)}°C` : ''}`,
+      subject: `🌊 Bala Bay: ${deltaSign}${deltaIn?.toFixed(1) ?? '?'} in vs July avg${waterTemp ? ` · ${waterTemp.tempC.toFixed(1)}°C` : ''}`,
       html: html,
       text: text,
-      attachments: [
-        csvAttachment,
-        ...(tempChartBuffer ? [{
-          filename: 'temp-spaghetti-chart.png',
-          content: tempChartBuffer.toString('base64'),
-        }] : []),
-      ],
     }),
   });
 
