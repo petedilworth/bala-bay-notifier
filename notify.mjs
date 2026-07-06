@@ -64,6 +64,10 @@ const ERDDAP_MIRRORS = [
   'https://polarwatch.noaa.gov/erddap/griddap',
   'https://erddap.emodnet.eu/erddap/griddap',
   'https://erddap.riddc.brown.edu/erddap/griddap',
+  // Direct PFEG servers last: they blacklisted the runner IP in May 2026 after
+  // high request volume, but volume is now low and the block may have lapsed
+  'https://coastwatch.pfeg.noaa.gov/erddap/griddap',
+  'https://upwell.pfeg.noaa.gov/erddap/griddap',
 ];
 
 // ── Tunable constants ──
@@ -73,6 +77,10 @@ const CHART_HEIGHT_PX = 120;
 const CHART_MIN_BAR_PX = 3;
 const CHART_MIN_RANGE = 0.01;
 const ERDDAP_TIMEOUT_MS = 20000;
+const ERDDAP_DEADLINE_MS = 6 * 60 * 1000; // total time budget for historical backfill
+const BACKFILL_START = '2021-01-01';      // 5+ seasons for the spaghetti chart
+const BACKFILL_CHUNK_DAYS = 200;          // ERDDAP reads one file per day server-side; keep queries small
+const BACKFILL_MAX_CHUNKS = 4;            // per run; cache catches up across daily runs
 const OGC_TIMEOUT_MS = 15000;
 const OUTLIER_THRESHOLD_M = 0.5;
 
@@ -153,21 +161,32 @@ async function fetchWaterTemp() {
   // MUR SST: 0.01° resolution global SST analysis, updated daily
   // Uses "(last)" to get most recent available data point — tries each mirror in order
   for (const mirror of ERDDAP_MIRRORS) {
+    const { hostname } = new URL(mirror);
     const url = `${mirror}/jplMURSST41.json?analysed_sst[(last)][(${BALA_LAT})][(${BALA_LON})]`;
     try {
-      const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
-      if (!resp.ok) continue;
+      const resp = await fetch(url, { signal: AbortSignal.timeout(ERDDAP_TIMEOUT_MS) });
+      if (!resp.ok) {
+        // resp.url is the final URL after redirects — ERDDAP mirrors of PFEG
+        // datasets redirect data requests back to the origin server
+        console.log(`  Water temp HTTP ${resp.status} from ${hostname} (final URL: ${resp.url})`);
+        continue;
+      }
       const data = await resp.json();
       const rows = data?.table?.rows;
-      if (!rows || rows.length === 0) continue;
+      if (!rows || rows.length === 0) {
+        console.log(`  Water temp: empty response from ${hostname}`);
+        continue;
+      }
       // Row format: [time, latitude, longitude, analysed_sst]
       const sst = rows[0][3];
-      if (sst == null) continue; // land-masked or missing
+      if (sst == null) {
+        console.log(`  Water temp: null SST (land-masked?) from ${hostname}`);
+        continue;
+      }
       const time = rows[0][0];
       const date = time ? time.substring(0, 10) : null;
       return { tempC: Math.round(sst * 10) / 10, date };
     } catch (e) {
-      const { hostname } = new URL(mirror);
       console.log(`  Water temp fetch failed (${hostname}): ${e.message}`);
     }
   }
@@ -221,101 +240,101 @@ function parseERDDAPCsv(text) {
   return records;
 }
 
+// Fetch one date range from ERDDAP, trying CSV then JSON across all mirrors.
+// Returns records[] on success, null if every attempt failed or the deadline passed.
+async function fetchTempChunk(startDate, endDate, deadlineAt) {
+  const startTs = `${startDate}T09:00:00Z`;
+  const endTs = `${endDate}T09:00:00Z`;
+  for (const format of ['csv', 'json']) {
+    for (const mirror of ERDDAP_MIRRORS) {
+      if (Date.now() > deadlineAt) {
+        console.log('  ERDDAP time budget exhausted');
+        return null;
+      }
+      const { hostname } = new URL(mirror);
+      const url = `${mirror}/jplMURSST41.${format}?analysed_sst[(${startTs}):(${endTs})][(${BALA_LAT})][(${BALA_LON})]`;
+      console.log(`  Trying ERDDAP ${format.toUpperCase()}: ${startDate} to ${endDate} via ${hostname} (${ERDDAP_TIMEOUT_MS / 1000}s timeout)...`);
+      try {
+        const resp = await fetch(url, { signal: AbortSignal.timeout(ERDDAP_TIMEOUT_MS) });
+        if (!resp.ok) {
+          const errBody = await resp.text().catch(() => '');
+          console.log(`  ERDDAP HTTP ${resp.status} (final URL: ${resp.url}): ${errBody.substring(0, 200)}`);
+          continue;
+        }
+        let records;
+        if (format === 'csv') {
+          records = parseERDDAPCsv(await resp.text());
+        } else {
+          const rows = (await resp.json())?.table?.rows || [];
+          records = [];
+          for (const row of rows) {
+            const dateStr = row[0]?.substring(0, 10);
+            const sst = row[3];
+            if (dateStr && sst != null && !isNaN(sst)) {
+              records.push(toRecord(dateStr, Math.round(sst * 10) / 10));
+            }
+          }
+        }
+        if (records.length > 0) {
+          console.log(`  ERDDAP returned ${records.length} records via ${hostname}`);
+          return records;
+        }
+        console.log(`  ERDDAP returned no records via ${hostname}`);
+      } catch (e) {
+        console.log(`  ERDDAP ${format.toUpperCase()} failed (${hostname}): ${e.message}`);
+      }
+    }
+  }
+  return null;
+}
+
+function addDays(dateStr, n) {
+  const d = new Date(dateStr + 'T12:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().substring(0, 10);
+}
+
 async function fetchHistoricalWaterTemp() {
   const cached = await loadCachedTemp();
   const latestCached = cached.length > 0 ? cached[cached.length - 1].date : null;
 
-  let startDate;
-  if (latestCached) {
-    const next = new Date(latestCached + 'T12:00:00Z');
-    next.setUTCDate(next.getUTCDate() + 1);
-    startDate = next.toISOString().substring(0, 10);
-  } else {
-    startDate = '2002-06-01';
-  }
+  let startDate = latestCached ? addDays(latestCached, 1) : BACKFILL_START;
 
   // MUR SST data lags ~2 days behind real-time
-  const endDt = new Date();
-  endDt.setUTCDate(endDt.getUTCDate() - 3);
-  const endDate = endDt.toISOString().substring(0, 10);
+  const endDate = addDays(new Date().toISOString().substring(0, 10), -3);
 
   if (startDate > endDate) {
     console.log(`  Historical temp: cache is current (${cached.length} records)`);
     return cached;
   }
 
-  const endTs = `${endDate}T09:00:00Z`;
+  // Backfill oldest-first in small chunks, saving after each so partial
+  // progress survives failures and the cache catches up across daily runs
+  const deadlineAt = Date.now() + ERDDAP_DEADLINE_MS;
+  const byDate = new Map(cached.map(r => [r.date, r]));
+  let all = cached;
+  let fetchedAny = false;
 
-  const tryStart = latestCached ? startDate : '2024-01-01';
-  const ts = `${tryStart}T09:00:00Z`;
+  for (let chunk = 0; chunk < BACKFILL_MAX_CHUNKS && startDate <= endDate; chunk++) {
+    let chunkEnd = addDays(startDate, BACKFILL_CHUNK_DAYS - 1);
+    if (chunkEnd > endDate) chunkEnd = endDate;
 
-  let newRecords = null;
+    const records = await fetchTempChunk(startDate, chunkEnd, deadlineAt);
+    if (!records) break; // stop on failure so the cache never develops gaps
 
-  // CSV — try each mirror in order
-  if (ts <= endTs) {
-    for (const mirror of ERDDAP_MIRRORS) {
-      const { hostname } = new URL(mirror);
-      const url = `${mirror}/jplMURSST41.csv?analysed_sst[(${ts}):(${endTs})][(${BALA_LAT})][(${BALA_LON})]`;
-      console.log(`  Trying ERDDAP CSV: ${tryStart} to ${endDate} via ${hostname} (${ERDDAP_TIMEOUT_MS / 1000}s timeout)...`);
-      try {
-        const resp = await fetch(url, { signal: AbortSignal.timeout(ERDDAP_TIMEOUT_MS) });
-        if (resp.ok) {
-          newRecords = parseERDDAPCsv(await resp.text());
-          console.log(`  ERDDAP returned ${newRecords.length} records (from ${tryStart} via ${hostname})`);
-          break;
-        }
-        const errBody = await resp.text().catch(() => '');
-        console.log(`  ERDDAP HTTP ${resp.status}: ${errBody.substring(0, 300)}`);
-      } catch (e) {
-        console.log(`  ERDDAP CSV failed (${hostname}): ${e.message}`);
-      }
-    }
+    for (const r of records) byDate.set(r.date, r);
+    all = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+    await saveTempCache(all);
+    fetchedAny = true;
+
+    startDate = addDays(chunkEnd, 1);
   }
 
-  // JSON fallback — try each mirror in order
-  if ((!newRecords || newRecords.length === 0) && ts <= endTs) {
-    for (const mirror of ERDDAP_MIRRORS) {
-      const { hostname } = new URL(mirror);
-      const url = `${mirror}/jplMURSST41.json?analysed_sst[(${ts}):(${endTs})][(${BALA_LAT})][(${BALA_LON})]`;
-      console.log(`  Trying ERDDAP JSON: ${tryStart} to ${endDate} via ${hostname} (${ERDDAP_TIMEOUT_MS / 1000}s timeout)...`);
-      try {
-        const resp = await fetch(url, { signal: AbortSignal.timeout(ERDDAP_TIMEOUT_MS) });
-        if (!resp.ok) {
-          const errBody = await resp.text().catch(() => '');
-          console.log(`  ERDDAP JSON HTTP ${resp.status}: ${errBody.substring(0, 300)}`);
-          continue;
-        }
-        const data = await resp.json();
-        const rows = data?.table?.rows;
-        if (rows && rows.length > 0) {
-          newRecords = [];
-          for (const row of rows) {
-            const dateStr = row[0]?.substring(0, 10);
-            const sst = row[3];
-            if (dateStr && sst != null && !isNaN(sst)) {
-              newRecords.push(toRecord(dateStr, Math.round(sst * 10) / 10));
-            }
-          }
-          console.log(`  ERDDAP JSON returned ${newRecords.length} records (via ${hostname})`);
-          break;
-        }
-      } catch (je) {
-        console.log(`  ERDDAP JSON failed (${hostname}): ${je.message}`);
-      }
-    }
-  }
-
-  if (!newRecords || newRecords.length === 0) {
-    console.log(`  All ERDDAP attempts failed`);
+  if (!fetchedAny) {
+    console.log('  All ERDDAP attempts failed');
     return cached.length > 0 ? cached : null;
   }
 
-  // Merge: cached + new, deduplicate by date
-  const byDate = new Map(cached.map(r => [r.date, r]));
-  for (const r of newRecords) byDate.set(r.date, r);
-  const all = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
-
-  await saveTempCache(all);
   console.log(`  Historical temp: ${all.length} records across ${new Set(all.map(r => r.year)).size} years`);
   return all;
 }
@@ -742,6 +761,16 @@ async function main() {
   console.log('🌊 Bala Bay Daily Water Level Notification');
   console.log('──────────────────────────────────────────');
 
+  // Fetch-only mode: update the water temperature cache and exit (no email,
+  // no secrets needed). Useful for seeding data/water-temp.csv from a machine
+  // whose IP isn't blocked by the ERDDAP servers.
+  if (process.argv.includes('--fetch-only')) {
+    console.log('Fetch-only mode: updating water temperature cache...');
+    const records = await fetchHistoricalWaterTemp();
+    console.log(records ? `Done: ${records.length} records in ${TEMP_CSV_PATH}` : 'No records fetched.');
+    return;
+  }
+
   // Validate config
   if (!RESEND_API_KEY) throw new Error('Missing RESEND_API_KEY');
   if (EMAIL_TO.length === 0) throw new Error('Missing EMAIL_TO');
@@ -1010,13 +1039,13 @@ async function main() {
       ` : ''}
 
       ${tempChartBuffer ? `
-      <!-- Water Temperature Spaghetti Chart (inline base64 PNG) -->
+      <!-- Water Temperature Spaghetti Chart (CID inline image — Gmail strips data: URIs) -->
       <div style="margin-bottom:16px;">
-        <img src="data:image/png;base64,${tempChartBuffer.toString('base64')}" alt="Water temperature year-over-year chart" style="width:100%;max-width:560px;height:auto;border-radius:8px;border:1px solid #E0DAD2;display:block;" />
+        <img src="cid:temp-chart" alt="Water temperature year-over-year chart" style="width:100%;max-width:560px;height:auto;border-radius:8px;border:1px solid #E0DAD2;display:block;" />
         <div style="margin-top:6px;font-size:9px;color:#999;">
           <span style="display:inline-block;width:16px;border-top:2.5px solid #2D6A9F;vertical-align:middle;margin-right:4px;"></span>${CURRENT_YEAR} YTD
           <span style="display:inline-block;width:16px;border-top:1.5px solid #444;vertical-align:middle;margin-left:10px;margin-right:4px;"></span>${CURRENT_YEAR - 1}
-          <span style="display:inline-block;width:16px;border-top:1px solid rgba(180,180,180,0.6);vertical-align:middle;margin-left:10px;margin-right:4px;"></span>2002\u2013${CURRENT_YEAR - 2}
+          <span style="display:inline-block;width:16px;border-top:1px solid rgba(180,180,180,0.6);vertical-align:middle;margin-left:10px;margin-right:4px;"></span>${BACKFILL_START.substring(0, 4)}\u2013${CURRENT_YEAR - 2}
         </div>
         <div style="font-size:8px;color:#BBB;margin-top:2px;">Source: NOAA MUR SST v4.1</div>
       </div>
@@ -1098,6 +1127,13 @@ async function main() {
       subject: `🌊 Bala Bay: ${deltaSign}${deltaIn?.toFixed(1) ?? '?'} in vs July avg${waterTemp ? ` · ${waterTemp.tempC.toFixed(1)}°C` : ''}`,
       html: html,
       text: text,
+      ...(tempChartBuffer ? {
+        attachments: [{
+          filename: 'water-temp-chart.png',
+          content: tempChartBuffer.toString('base64'),
+          content_id: 'temp-chart',
+        }],
+      } : {}),
     }),
   });
 
