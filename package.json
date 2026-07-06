@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20.9.0"
+  },
   "dependencies": {
     "chart.js": "^4.4.0",
     "chartjs-node-canvas": "^5.0.0"
