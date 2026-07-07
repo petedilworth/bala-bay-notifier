@@ -60,15 +60,26 @@ const FLOW_STATIONS = [
 // Bala Bay coordinates for satellite SST lookup
 const BALA_LAT = 45.01;
 const BALA_LON = -79.6;
+// Verified 2026-07-06: polarwatch no longer loads jplMURSST41 (404), and
+// emodnet/riddc are EDDGridFromErddap entries that redirect data requests to
+// coastwatch.pfeg.noaa.gov — whose blacklist still covers GitHub runner IPs.
 const ERDDAP_MIRRORS = [
-  'https://polarwatch.noaa.gov/erddap/griddap',
-  'https://erddap.emodnet.eu/erddap/griddap',
-  'https://erddap.riddc.brown.edu/erddap/griddap',
-  // Direct PFEG servers last: they blacklisted the runner IP in May 2026 after
-  // high request volume, but volume is now low and the block may have lapsed
+  'https://spraydata.ucsd.edu/erddap/griddap',    // Scripps
+  'https://erddap.marine.usf.edu/erddap/griddap', // USF
+  // PFEG origin servers: blocked from GitHub runners but work from
+  // residential IPs, which --fetch-only relies on
   'https://coastwatch.pfeg.noaa.gov/erddap/griddap',
   'https://upwell.pfeg.noaa.gov/erddap/griddap',
 ];
+// NCEI hosts the GHRSST MUR archive as one netCDF file per day with OPeNDAP
+// subsetting — separate infrastructure from the blacklisted PFEG cluster.
+// No range queries, so it's a fallback for single days and small gaps only.
+const NCEI_THREDDS_BASE = 'https://www.ncei.noaa.gov/thredds-ocean';
+const NCEI_MUR_PATH = 'ghrsst/L4/GLOB/JPL/MUR';
+// MUR grid: lat -89.99..89.99, lon -179.99..179.99, both step 0.01
+const MUR_LAT_IDX = Math.round((BALA_LAT + 89.99) / 0.01);  // 13500
+const MUR_LON_IDX = Math.round((BALA_LON + 179.99) / 0.01); // 10039
+const NCEI_MAX_GAP_DAYS = 30; // largest gap worth filling one day at a time
 
 // ── Tunable constants ──
 const CM_PER_INCH = 2.54;
@@ -190,7 +201,71 @@ async function fetchWaterTemp() {
       console.log(`  Water temp fetch failed (${hostname}): ${e.message}`);
     }
   }
+
+  // Fallback: NCEI THREDDS archive, probing backwards from the most recent
+  // plausible day (MUR lags ~2 days; the NCEI archive a little more)
+  console.log('  All ERDDAP mirrors failed — falling back to NCEI THREDDS...');
+  for (let back = 2; back <= 8; back++) {
+    const result = await fetchMurPointNCEI(addDays(TODAY_ISO, -back));
+    if (result) return result;
+  }
   return null;
+}
+
+// ── NCEI THREDDS fallback: per-day GHRSST MUR granules via OPeNDAP ──
+
+function parseMurAscii(text) {
+  // DAP2 .ascii grid output: the data line looks like "[0][13500], 288.123"
+  const m = text.match(/^\[\d+\](?:\[\d+\])*,\s*(-?\d+(?:\.\d+)?)/m);
+  if (!m) return null;
+  let v = parseFloat(m[1]);
+  if (isNaN(v)) return null;
+  // The granule stores analysed_sst as a packed short (scale 0.001, offset
+  // 298.15 K); some TDS configs unpack to Kelvin or Celsius floats. Packed
+  // shorts print as integers, floats with a decimal point. Range-check last
+  // (also rejects the -32768 fill value).
+  if (!m[1].includes('.')) v = v * 0.001 + 298.15 - 273.15;
+  else if (v > 200 && v < 320) v = v - 273.15;
+  if (v < -5 || v > 45) return null;
+  return v;
+}
+
+async function fetchMurPointNCEI(dateStr) {
+  const year = dateStr.substring(0, 4);
+  const doy = String(toRecord(dateStr, 0).dayOfYear).padStart(3, '0');
+  const dir = `${NCEI_MUR_PATH}/${year}/${doy}`;
+  try {
+    // Granule filenames vary across GDS versions — list the day's catalog
+    // instead of guessing
+    const catResp = await fetch(`${NCEI_THREDDS_BASE}/catalog/${dir}/catalog.xml`, {
+      signal: AbortSignal.timeout(ERDDAP_TIMEOUT_MS),
+    });
+    if (!catResp.ok) {
+      console.log(`  NCEI catalog HTTP ${catResp.status} for ${dateStr}`);
+      return null;
+    }
+    const fileMatch = (await catResp.text()).match(/name="([^"]*MUR[^"]*\.nc)"/i);
+    if (!fileMatch) {
+      console.log(`  NCEI: no MUR granule listed for ${dateStr}`);
+      return null;
+    }
+    const url = `${NCEI_THREDDS_BASE}/dodsC/${dir}/${fileMatch[1]}.ascii?analysed_sst[0][${MUR_LAT_IDX}][${MUR_LON_IDX}]`;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(ERDDAP_TIMEOUT_MS) });
+    if (!resp.ok) {
+      console.log(`  NCEI OPeNDAP HTTP ${resp.status} for ${dateStr}`);
+      return null;
+    }
+    const tempC = parseMurAscii(await resp.text());
+    if (tempC === null) {
+      console.log(`  NCEI: could not parse SST for ${dateStr}`);
+      return null;
+    }
+    console.log(`  NCEI THREDDS: ${dateStr} = ${tempC.toFixed(1)}°C`);
+    return { tempC: Math.round(tempC * 10) / 10, date: dateStr };
+  } catch (e) {
+    console.log(`  NCEI fetch failed for ${dateStr}: ${e.message}`);
+    return null;
+  }
 }
 
 // ── Historical water temperature for spaghetti chart (MUR SST v4.1 starts 2002-06-01) ──
@@ -320,7 +395,27 @@ async function fetchHistoricalWaterTemp() {
     if (chunkEnd > endDate) chunkEnd = endDate;
 
     const records = await fetchTempChunk(startDate, chunkEnd, deadlineAt);
-    if (!records) break; // stop on failure so the cache never develops gaps
+    if (!records) {
+      // ERDDAP failed entirely. If the remaining gap is small (the normal
+      // case once the cache is seeded), fill it one day at a time from NCEI.
+      const gapDays = Math.round((new Date(endDate) - new Date(startDate)) / 86400000) + 1;
+      if (gapDays <= NCEI_MAX_GAP_DAYS) {
+        console.log(`  Topping up ${gapDays}-day gap from NCEI THREDDS...`);
+        for (let d = startDate; d <= endDate && Date.now() < deadlineAt; d = addDays(d, 1)) {
+          const point = await fetchMurPointNCEI(d);
+          if (point) {
+            byDate.set(point.date, toRecord(point.date, point.tempC));
+            fetchedAny = true;
+          }
+          await new Promise(r => setTimeout(r, 100));
+        }
+        if (fetchedAny) {
+          all = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+          await saveTempCache(all);
+        }
+      }
+      break; // stop the chunk loop so the cache never develops gaps
+    }
 
     for (const r of records) byDate.set(r.date, r);
     all = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
