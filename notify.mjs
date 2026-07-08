@@ -29,7 +29,7 @@ const CURRENT_YEAR = parseInt(TODAY_ISO.substring(0, 4));
 const LOW_WATER_START = `${CURRENT_YEAR}-01-01`;
 const LOW_WATER_END = TODAY_ISO;
 // Daily-mean history fetched per station (used for July average, low water,
-// and 60-day chart backfill).
+// and chart backfill).
 const HISTORY_START = `${CURRENT_YEAR - 5}-01-01`;
 const HISTORY_END = TODAY_ISO;
 
@@ -61,24 +61,33 @@ const FLOW_STATIONS = [
 const BALA_LAT = 45.01;
 const BALA_LON = -79.6;
 const ERDDAP_MIRRORS = [
-  'https://polarwatch.noaa.gov/erddap/griddap',
-  'https://erddap.emodnet.eu/erddap/griddap',
-  'https://erddap.riddc.brown.edu/erddap/griddap',
-  // Direct PFEG servers last: they blacklisted the runner IP in May 2026 after
-  // high request volume, but volume is now low and the block may have lapsed
+  'https://polarwatch.noaa.gov/erddap/griddap',   // sometimes 404s while its copy reloads
+  'https://spraydata.ucsd.edu/erddap/griddap',    // Scripps
+  'https://erddap.marine.usf.edu/erddap/griddap', // USF
+  // PFEG origin servers last: their blacklist covers GitHub runner IPs when
+  // active, but they always work from residential IPs (--fetch-only)
   'https://coastwatch.pfeg.noaa.gov/erddap/griddap',
   'https://upwell.pfeg.noaa.gov/erddap/griddap',
 ];
+// NCEI hosts the GHRSST MUR archive as one netCDF file per day with OPeNDAP
+// subsetting — separate infrastructure from the blacklisted PFEG cluster.
+// No range queries, so it's a fallback for single days and small gaps only.
+const NCEI_THREDDS_BASE = 'https://www.ncei.noaa.gov/thredds-ocean';
+const NCEI_MUR_PATH = 'ghrsst/L4/GLOB/JPL/MUR';
+// MUR grid: lat -89.99..89.99, lon -179.99..179.99, both step 0.01
+const MUR_LAT_IDX = Math.round((BALA_LAT + 89.99) / 0.01);  // 13500
+const MUR_LON_IDX = Math.round((BALA_LON + 179.99) / 0.01); // 10039
+const NCEI_MAX_GAP_DAYS = 30; // largest gap worth filling one day at a time
 
 // ── Tunable constants ──
 const CM_PER_INCH = 2.54;
-const CHART_DAYS = 60;
+const CHART_DAYS = 90;  // trailing calendar-day window for level/flow charts
 const CHART_HEIGHT_PX = 120;
 const CHART_MIN_BAR_PX = 3;
 const CHART_MIN_RANGE = 0.01;
 const ERDDAP_TIMEOUT_MS = 20000;
 const ERDDAP_DEADLINE_MS = 6 * 60 * 1000; // total time budget for historical backfill
-const BACKFILL_START = '2021-01-01';      // 5+ seasons for the spaghetti chart
+const BACKFILL_START = '2002-06-01';      // MUR SST v4.1 starts here — earliest available
 const BACKFILL_CHUNK_DAYS = 200;          // ERDDAP reads one file per day server-side; keep queries small
 const BACKFILL_MAX_CHUNKS = 4;            // per run; cache catches up across daily runs
 const OGC_TIMEOUT_MS = 15000;
@@ -190,7 +199,71 @@ async function fetchWaterTemp() {
       console.log(`  Water temp fetch failed (${hostname}): ${e.message}`);
     }
   }
+
+  // Fallback: NCEI THREDDS archive, probing backwards from the most recent
+  // plausible day (MUR lags ~2 days; the NCEI archive a little more)
+  console.log('  All ERDDAP mirrors failed — falling back to NCEI THREDDS...');
+  for (let back = 2; back <= 8; back++) {
+    const result = await fetchMurPointNCEI(addDays(TODAY_ISO, -back));
+    if (result) return result;
+  }
   return null;
+}
+
+// ── NCEI THREDDS fallback: per-day GHRSST MUR granules via OPeNDAP ──
+
+function parseMurAscii(text) {
+  // DAP2 .ascii grid output: the data line looks like "[0][13500], 288.123"
+  const m = text.match(/^\[\d+\](?:\[\d+\])*,\s*(-?\d+(?:\.\d+)?)/m);
+  if (!m) return null;
+  let v = parseFloat(m[1]);
+  if (isNaN(v)) return null;
+  // The granule stores analysed_sst as a packed short (scale 0.001, offset
+  // 298.15 K); some TDS configs unpack to Kelvin or Celsius floats. Packed
+  // shorts print as integers, floats with a decimal point. Range-check last
+  // (also rejects the -32768 fill value).
+  if (!m[1].includes('.')) v = v * 0.001 + 298.15 - 273.15;
+  else if (v > 200 && v < 320) v = v - 273.15;
+  if (v < -5 || v > 45) return null;
+  return v;
+}
+
+async function fetchMurPointNCEI(dateStr) {
+  const year = dateStr.substring(0, 4);
+  const doy = String(toRecord(dateStr, 0).dayOfYear).padStart(3, '0');
+  const dir = `${NCEI_MUR_PATH}/${year}/${doy}`;
+  try {
+    // Granule filenames vary across GDS versions — list the day's catalog
+    // instead of guessing
+    const catResp = await fetch(`${NCEI_THREDDS_BASE}/catalog/${dir}/catalog.xml`, {
+      signal: AbortSignal.timeout(ERDDAP_TIMEOUT_MS),
+    });
+    if (!catResp.ok) {
+      console.log(`  NCEI catalog HTTP ${catResp.status} for ${dateStr}`);
+      return null;
+    }
+    const fileMatch = (await catResp.text()).match(/name="([^"]*MUR[^"]*\.nc)"/i);
+    if (!fileMatch) {
+      console.log(`  NCEI: no MUR granule listed for ${dateStr}`);
+      return null;
+    }
+    const url = `${NCEI_THREDDS_BASE}/dodsC/${dir}/${fileMatch[1]}.ascii?analysed_sst[0][${MUR_LAT_IDX}][${MUR_LON_IDX}]`;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(ERDDAP_TIMEOUT_MS) });
+    if (!resp.ok) {
+      console.log(`  NCEI OPeNDAP HTTP ${resp.status} for ${dateStr}`);
+      return null;
+    }
+    const tempC = parseMurAscii(await resp.text());
+    if (tempC === null) {
+      console.log(`  NCEI: could not parse SST for ${dateStr}`);
+      return null;
+    }
+    console.log(`  NCEI THREDDS: ${dateStr} = ${tempC.toFixed(1)}°C`);
+    return { tempC: Math.round(tempC * 10) / 10, date: dateStr };
+  } catch (e) {
+    console.log(`  NCEI fetch failed for ${dateStr}: ${e.message}`);
+    return null;
+  }
 }
 
 // ── Historical water temperature for spaghetti chart (MUR SST v4.1 starts 2002-06-01) ──
@@ -223,6 +296,39 @@ async function saveTempCache(records) {
   await fs.mkdir(__dirname + 'data', { recursive: true });
   const rows = records.map(r => `${r.date},${r.tempC}`);
   await fs.writeFile(TEMP_CSV_PATH, 'date,tempC\n' + rows.join('\n') + '\n', 'utf8');
+}
+
+// ── Daily level/flow observation cache ──
+// The realtime API only keeps ~1 month and daily means lag months behind, so
+// observed daily values are cached in the repo (like the temp cache) to let
+// the charts show a full trailing window.
+
+const LEVEL_CACHE_PATH = __dirname + 'data/level-history.json';
+
+let levelCachePromise = null;
+function getLevelCache() {
+  if (!levelCachePromise) {
+    levelCachePromise = fs.readFile(LEVEL_CACHE_PATH, 'utf8')
+      .then(JSON.parse)
+      .catch(() => ({}));
+  }
+  return levelCachePromise;
+}
+
+async function saveLevelCache() {
+  const cache = await getLevelCache();
+  await fs.mkdir(__dirname + 'data', { recursive: true });
+  await fs.writeFile(LEVEL_CACHE_PATH, JSON.stringify(cache, null, 1), 'utf8');
+}
+
+// Merge freshly observed daily values into the cache under `key` and return
+// the combined series. Fresh values win; only the last ~400 days are kept.
+function mergeWithLevelCache(cache, key, days) {
+  const entry = cache[key] || {};
+  for (const d of days) entry[d.date] = Math.round(d.value * 10000) / 10000;
+  const keep = Object.keys(entry).sort().slice(-400);
+  cache[key] = Object.fromEntries(keep.map(k => [k, entry[k]]));
+  return keep.map(date => ({ date, value: cache[key][date] }));
 }
 
 function parseERDDAPCsv(text) {
@@ -298,41 +404,74 @@ async function fetchHistoricalWaterTemp() {
   const cached = await loadCachedTemp();
   const latestCached = cached.length > 0 ? cached[cached.length - 1].date : null;
 
-  let startDate = latestCached ? addDays(latestCached, 1) : BACKFILL_START;
-
   // MUR SST data lags ~2 days behind real-time
-  const endDate = addDays(new Date().toISOString().substring(0, 10), -3);
+  const endDate = addDays(TODAY_ISO, -3);
 
-  if (startDate > endDate) {
-    console.log(`  Historical temp: cache is current (${cached.length} records)`);
-    return cached;
-  }
+  // --fetch-only runs (seeding from an unblocked IP) get a much bigger budget
+  const fetchOnly = process.argv.includes('--fetch-only');
+  const maxChunks = fetchOnly ? 60 : BACKFILL_MAX_CHUNKS;
+  const deadlineAt = Date.now() + (fetchOnly ? 5 : 1) * ERDDAP_DEADLINE_MS;
 
-  // Backfill oldest-first in small chunks, saving after each so partial
-  // progress survives failures and the cache catches up across daily runs
-  const deadlineAt = Date.now() + ERDDAP_DEADLINE_MS;
   const byDate = new Map(cached.map(r => [r.date, r]));
   let all = cached;
   let fetchedAny = false;
+  let chunksUsed = 0;
 
-  for (let chunk = 0; chunk < BACKFILL_MAX_CHUNKS && startDate <= endDate; chunk++) {
-    let chunkEnd = addDays(startDate, BACKFILL_CHUNK_DAYS - 1);
-    if (chunkEnd > endDate) chunkEnd = endDate;
-
-    const records = await fetchTempChunk(startDate, chunkEnd, deadlineAt);
-    if (!records) break; // stop on failure so the cache never develops gaps
-
-    for (const r of records) byDate.set(r.date, r);
+  const save = async () => {
     all = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
     await saveTempCache(all);
     fetchedAny = true;
+  };
 
+  // 1. Tail: extend forward from the newest cached day (oldest chunk first)
+  let startDate = latestCached ? addDays(latestCached, 1) : BACKFILL_START;
+  while (startDate <= endDate && chunksUsed < maxChunks && Date.now() < deadlineAt) {
+    let chunkEnd = addDays(startDate, BACKFILL_CHUNK_DAYS - 1);
+    if (chunkEnd > endDate) chunkEnd = endDate;
+    chunksUsed++;
+    const records = await fetchTempChunk(startDate, chunkEnd, deadlineAt);
+    if (!records) {
+      // ERDDAP failed entirely. If the remaining gap is small (the normal
+      // case once the cache is seeded), fill it one day at a time from NCEI.
+      const gapDays = Math.round((new Date(endDate) - new Date(startDate)) / 86400000) + 1;
+      if (gapDays <= NCEI_MAX_GAP_DAYS) {
+        console.log(`  Topping up ${gapDays}-day gap from NCEI THREDDS...`);
+        for (let d = startDate; d <= endDate && Date.now() < deadlineAt; d = addDays(d, 1)) {
+          const point = await fetchMurPointNCEI(d);
+          if (point) byDate.set(point.date, toRecord(point.date, point.tempC));
+          await new Promise(r => setTimeout(r, 100));
+        }
+        if (byDate.size > cached.length) await save();
+      }
+      break; // stop so the cache never develops interior gaps
+    }
+    for (const r of records) byDate.set(r.date, r);
+    await save();
     startDate = addDays(chunkEnd, 1);
   }
 
+  // 2. Head: extend backward from the oldest cached day toward BACKFILL_START,
+  //    newest chunk first so the cached block always stays contiguous
+  let earliest = all.length > 0 ? all[0].date : null;
+  while (earliest && earliest > BACKFILL_START && chunksUsed < maxChunks && Date.now() < deadlineAt) {
+    const chunkEnd = addDays(earliest, -1);
+    let chunkStart = addDays(chunkEnd, -(BACKFILL_CHUNK_DAYS - 1));
+    if (chunkStart < BACKFILL_START) chunkStart = BACKFILL_START;
+    chunksUsed++;
+    const records = await fetchTempChunk(chunkStart, chunkEnd, deadlineAt);
+    if (!records) break;
+    for (const r of records) byDate.set(r.date, r);
+    await save();
+    earliest = chunkStart;
+  }
+
   if (!fetchedAny) {
+    if (cached.length > 0) {
+      console.log(`  Historical temp: cache is current (${cached.length} records)`);
+      return cached;
+    }
     console.log('  All ERDDAP attempts failed');
-    return cached.length > 0 ? cached : null;
+    return null;
   }
 
   console.log(`  Historical temp: ${all.length} records across ${new Set(all.map(r => r.year)).size} years`);
@@ -365,11 +504,11 @@ async function buildTempSpaghettiChart(records) {
       width = 2.5;
       order = 0;
     } else if (year === prevYear) {
-      color = '#444444';
-      width = 1.5;
+      color = '#C0392B';
+      width = 2;
       order = 1;
     } else {
-      color = 'rgba(180, 180, 180, 0.4)';
+      color = 'rgba(150, 150, 150, 0.55)';
       width = 1;
       order = 2;
     }
@@ -414,14 +553,20 @@ async function buildTempSpaghettiChart(records) {
           type: 'linear',
           min: 1,
           max: 366,
+          // Chart.js has no "tick values" option for linear axes — replace the
+          // auto-generated ticks so one lands on the 1st of every month
+          afterBuildTicks: (axis) => {
+            axis.ticks = monthStarts.map(value => ({ value }));
+          },
           ticks: {
             callback: (val) => {
               const idx = monthStarts.indexOf(val);
               return idx >= 0 ? monthLabels[idx] : '';
             },
-            values: monthStarts,
             font: { size: 10, family: 'sans-serif' },
             color: '#6B6B6B',
+            autoSkip: false,
+            maxRotation: 0,
           },
           grid: { color: '#F0EDE8' },
         },
@@ -463,13 +608,21 @@ async function buildTempSpaghettiChart(records) {
 
 // ── Shared chart helpers ──
 
+// Trailing calendar window: data from the last n days, not the last n rows
+// (daily-mean history can lag months, leaving holes before the realtime data)
+function lastCalendarDays(days, n) {
+  const cutoff = addDays(TODAY_ISO, -(n - 1));
+  return days.filter(d => d.date >= cutoff);
+}
+
 function fmtShort(d) {
   return new Date(d.date + 'T12:00:00').toLocaleDateString('en-CA', { month: 'short', day: 'numeric' });
 }
 
 function buildWaterLevelChart(name, label, days, stJulyAvg, isFirst, stationId) {
   if (!days || days.length === 0) return null;
-  const chartDays = days.slice(-CHART_DAYS);
+  const chartDays = lastCalendarDays(days, CHART_DAYS);
+  if (chartDays.length === 0) return null;
   const hwm = stationId ? HIGH_WATER_MARKS[stationId] : null;
 
   const latest = chartDays[chartDays.length - 1];
@@ -492,7 +645,7 @@ function buildWaterLevelChart(name, label, days, stJulyAvg, isFirst, stationId) 
     const pct = (d.value - minVal) / range;
     const height = Math.max(CHART_MIN_BAR_PX, Math.round(pct * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
     const color = i === chartDays.length - 1 ? '#E07B4C' : '#4A9BD9';
-    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:6px;height:${height}px;background:${color};border-radius:1px;"></div></td>`;
+    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:4px;height:${height}px;background:${color};border-radius:1px;"></div></td>`;
   }).join('');
 
   let refLines = '';
@@ -523,7 +676,7 @@ function buildWaterLevelChart(name, label, days, stJulyAvg, isFirst, stationId) 
   const html = `
       <div style="${sectionStyle}">
         <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:2px;">${name} — ${label}</div>
-        <div style="font-size:9px;color:#999;margin-bottom:8px;">Water Level — Last ${chartDays.length} Days${vsJulyStr}</div>
+        <div style="font-size:9px;color:#999;margin-bottom:8px;">Water Level — Trailing ${CHART_DAYS} Days${vsJulyStr}</div>
         <div style="display:inline-block;">
           <div style="border-bottom:1px solid #E0DAD2;padding-left:2px;">
             <table style="border-collapse:collapse;height:${CHART_HEIGHT_PX}px;"><tr>${bars}</tr></table>
@@ -554,7 +707,8 @@ function buildSpreadChart(balaDays, balaJulyAvg, beauDays, beauJulyAvg) {
   }
   if (spreadDays.length === 0) return null;
 
-  const chartDays = spreadDays.slice(-CHART_DAYS);
+  const chartDays = lastCalendarDays(spreadDays, CHART_DAYS);
+  if (chartDays.length === 0) return null;
   const latestSpread = chartDays[chartDays.length - 1].spread;
 
   const values = chartDays.map(d => d.spread);
@@ -570,7 +724,7 @@ function buildSpreadChart(balaDays, balaJulyAvg, beauDays, beauJulyAvg) {
     const pct = (d.spread - minVal) / range;
     const height = Math.max(CHART_MIN_BAR_PX, Math.round(pct * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
     const color = d.spread >= 0 ? '#4A9BD9' : '#E07B4C';
-    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:6px;height:${height}px;background:${color};border-radius:1px;"></div></td>`;
+    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:4px;height:${height}px;background:${color};border-radius:1px;"></div></td>`;
   }).join('');
 
   const zeroPx = Math.max(1, Math.round(((0 - minVal) / range) * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
@@ -579,7 +733,7 @@ function buildSpreadChart(balaDays, balaJulyAvg, beauDays, beauJulyAvg) {
   const html = `
       <div style="margin-top:20px;border-top:1px solid #E0DAD2;padding-top:16px;">
         <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:2px;">Beaumaris vs Bala — Water Level Spread</div>
-        <div style="font-size:9px;color:#999;margin-bottom:8px;">Last ${chartDays.length} Days · Current: ${latestSpread >= 0 ? '+' : ''}${latestSpread.toFixed(1)}in</div>
+        <div style="font-size:9px;color:#999;margin-bottom:8px;">Trailing ${CHART_DAYS} Days · Current: ${latestSpread >= 0 ? '+' : ''}${latestSpread.toFixed(1)}in</div>
         <div style="display:inline-block;">
           <div style="border-bottom:1px solid #E0DAD2;padding-left:2px;">
             <table style="border-collapse:collapse;height:${CHART_HEIGHT_PX}px;"><tr>${bars}</tr></table>
@@ -603,7 +757,8 @@ function buildSpreadChart(balaDays, balaJulyAvg, beauDays, beauJulyAvg) {
 
 function buildFlowChart(name, label, days, isFirst) {
   if (!days || days.length === 0) return '';
-  const chartDays = days.slice(-CHART_DAYS);
+  const chartDays = lastCalendarDays(days, CHART_DAYS);
+  if (chartDays.length === 0) return '';
   const minVal = Math.min(...chartDays.map(d => d.value));
   const maxVal = Math.max(...chartDays.map(d => d.value));
   const range = maxVal - minVal || CHART_MIN_RANGE;
@@ -612,7 +767,7 @@ function buildFlowChart(name, label, days, isFirst) {
     const pct = (d.value - minVal) / range;
     const height = Math.max(CHART_MIN_BAR_PX, Math.round(pct * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
     const color = i === chartDays.length - 1 ? '#E07B4C' : '#6B8EAD';
-    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:6px;height:${height}px;background:${color};border-radius:1px;" title="${d.date}: ${d.value.toFixed(1)} m³/s"></div></td>`;
+    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:4px;height:${height}px;background:${color};border-radius:1px;" title="${d.date}: ${d.value.toFixed(1)} m³/s"></div></td>`;
   }).join('');
 
   const firstDate = chartDays[0];
@@ -627,7 +782,7 @@ function buildFlowChart(name, label, days, isFirst) {
   return `
       <div style="${sectionStyle}">
         <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:2px;">${name} — ${label}</div>
-        <div style="font-size:9px;color:#999;margin-bottom:8px;">Flow Rate — Last ${chartDays.length} Days · ${latest.value.toFixed(1)} m³/s</div>
+        <div style="font-size:9px;color:#999;margin-bottom:8px;">Flow Rate — Trailing ${CHART_DAYS} Days · ${latest.value.toFixed(1)} m³/s</div>
         <div style="display:inline-block;">
           <div style="position:relative;border-bottom:1px solid #E0DAD2;padding-left:2px;">
             <table style="border-collapse:collapse;height:${CHART_HEIGHT_PX}px;"><tr>${bars}</tr></table>
@@ -690,10 +845,12 @@ async function fetchStationData(stationId) {
     console.log(`    Daily-mean history failed: ${e.message}`);
   }
 
-  // 3. Combine history + realtime (realtime fills dates daily-mean hasn't published yet).
+  // 3. Combine history + realtime (realtime fills dates daily-mean hasn't
+  //    published yet), then merge with the on-disk cache of past observations.
   const histDates = new Set(result.history.map(d => d.date));
   const rtFill = result.realtimeDaily.filter(d => !histDates.has(d.date));
-  result.recentDays = [...result.history, ...rtFill].sort((a, b) => a.date.localeCompare(b.date));
+  const combined = [...result.history, ...rtFill].sort((a, b) => a.date.localeCompare(b.date));
+  result.recentDays = mergeWithLevelCache(await getLevelCache(), `level:${stationId}`, combined);
 
   // 4. July averages — all July days across the 5-year history.
   const julyVals = result.history
@@ -747,10 +904,12 @@ async function fetchFlowData(stationId) {
     console.log(`    Daily-mean flow failed: ${e.message}`);
   }
 
-  // Combine: history + realtime fill for dates history hasn't published yet
+  // Combine: history + realtime fill for dates history hasn't published yet,
+  // then merge with the on-disk cache of past observations
   const histDates = new Set(result.history.map(d => d.date));
   const rtFill = result.realtimeDaily.filter(d => !histDates.has(d.date));
-  result.recentDays = [...result.history, ...rtFill].sort((a, b) => a.date.localeCompare(b.date));
+  const combined = [...result.history, ...rtFill].sort((a, b) => a.date.localeCompare(b.date));
+  result.recentDays = mergeWithLevelCache(await getLevelCache(), `flow:${stationId}`, combined);
 
   return result;
 }
@@ -827,6 +986,9 @@ async function main() {
     fetchHistoricalWaterTemp(),
   ]);
   const tempF = waterTemp ? Math.round(waterTemp.tempC * 9 / 5 + 32) : null;
+  const tempMinYear = historicalTempRecords && historicalTempRecords.length > 0
+    ? historicalTempRecords[0].year
+    : null;
   if (waterTemp) {
     console.log(`  Water temp: ${waterTemp.tempC}°C (${tempF}°F) — ${waterTemp.date}`);
   } else {
@@ -877,6 +1039,11 @@ async function main() {
       return { ...st, recentDays: data.recentDays };
     })
   );
+
+  // All station/flow fetches are done — persist the observation cache so the
+  // workflow's data-commit step picks it up
+  await saveLevelCache();
+  console.log('  Level/flow observation cache saved');
 
   // 8. Dump diagnostic CSV with all computed values
   {
@@ -1044,8 +1211,8 @@ async function main() {
         <img src="cid:temp-chart" alt="Water temperature year-over-year chart" style="width:100%;max-width:560px;height:auto;border-radius:8px;border:1px solid #E0DAD2;display:block;" />
         <div style="margin-top:6px;font-size:9px;color:#999;">
           <span style="display:inline-block;width:16px;border-top:2.5px solid #2D6A9F;vertical-align:middle;margin-right:4px;"></span>${CURRENT_YEAR} YTD
-          <span style="display:inline-block;width:16px;border-top:1.5px solid #444;vertical-align:middle;margin-left:10px;margin-right:4px;"></span>${CURRENT_YEAR - 1}
-          <span style="display:inline-block;width:16px;border-top:1px solid rgba(180,180,180,0.6);vertical-align:middle;margin-left:10px;margin-right:4px;"></span>${BACKFILL_START.substring(0, 4)}\u2013${CURRENT_YEAR - 2}
+          <span style="display:inline-block;width:16px;border-top:2px solid #C0392B;vertical-align:middle;margin-left:10px;margin-right:4px;"></span>${CURRENT_YEAR - 1}
+          ${tempMinYear !== null && tempMinYear <= CURRENT_YEAR - 2 ? `<span style="display:inline-block;width:16px;border-top:1px solid rgba(150,150,150,0.7);vertical-align:middle;margin-left:10px;margin-right:4px;"></span>${tempMinYear < CURRENT_YEAR - 2 ? `${tempMinYear}\u2013${CURRENT_YEAR - 2}` : CURRENT_YEAR - 2}` : ''}
         </div>
         <div style="font-size:8px;color:#BBB;margin-top:2px;">Source: NOAA MUR SST v4.1</div>
       </div>
