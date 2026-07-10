@@ -77,7 +77,7 @@ const NCEI_MUR_PATH = 'ghrsst/L4/GLOB/JPL/MUR';
 // MUR grid: lat -89.99..89.99, lon -179.99..179.99, both step 0.01
 const MUR_LAT_IDX = Math.round((BALA_LAT + 89.99) / 0.01);  // 13500
 const MUR_LON_IDX = Math.round((BALA_LON + 179.99) / 0.01); // 10039
-const NCEI_MAX_GAP_DAYS = 30; // largest gap worth filling one day at a time
+const NCEI_MAX_GAP_DAYS = 90; // days filled per run, one at a time, when ERDDAP can't serve the range
 
 // ── Tunable constants ──
 const CM_PER_INCH = 2.54;
@@ -194,6 +194,10 @@ async function fetchWaterTemp() {
       }
       const time = rows[0][0];
       const date = time ? time.substring(0, 10) : null;
+      if (date && date < addDays(TODAY_ISO, -10)) {
+        console.log(`  Water temp from ${hostname} is stale (${date}) — trying next source`);
+        continue;
+      }
       return { tempC: Math.round(sst * 10) / 10, date };
     } catch (e) {
       console.log(`  Water temp fetch failed (${hostname}): ${e.message}`);
@@ -346,11 +350,40 @@ function parseERDDAPCsv(text) {
   return records;
 }
 
+// A mirror can serve a stale copy whose time axis ends months in the past.
+// ERDDAP hard-errors on any request extending past the axis end (it does not
+// clamp), so probe each mirror's last available day once per run and clamp
+// our requests to it. A failed probe returns null = extent unknown, still try.
+const mirrorEndCache = new Map();
+async function getMirrorEnd(mirror) {
+  if (mirrorEndCache.has(mirror)) return mirrorEndCache.get(mirror);
+  const { hostname } = new URL(mirror);
+  let end = null;
+  try {
+    const resp = await fetch(`${mirror}/jplMURSST41.json?time[(last)]`, {
+      signal: AbortSignal.timeout(ERDDAP_TIMEOUT_MS),
+    });
+    if (resp.ok) {
+      const t = (await resp.json())?.table?.rows?.[0]?.[0];
+      if (t) {
+        end = t.substring(0, 10);
+        console.log(`  ${hostname}: data ends ${end}`);
+      }
+    } else {
+      console.log(`  ${hostname}: end probe HTTP ${resp.status}`);
+    }
+  } catch (e) {
+    console.log(`  ${hostname}: end probe failed: ${e.message}`);
+  }
+  mirrorEndCache.set(mirror, end);
+  return end;
+}
+
 // Fetch one date range from ERDDAP, trying CSV then JSON across all mirrors.
-// Returns records[] on success, null if every attempt failed or the deadline passed.
+// A stale mirror is used for whatever part of the range it has — the caller
+// advances by the dates actually returned. Returns records[] on success,
+// null if every attempt failed or the deadline passed.
 async function fetchTempChunk(startDate, endDate, deadlineAt) {
-  const startTs = `${startDate}T09:00:00Z`;
-  const endTs = `${endDate}T09:00:00Z`;
   for (const format of ['csv', 'json']) {
     for (const mirror of ERDDAP_MIRRORS) {
       if (Date.now() > deadlineAt) {
@@ -358,8 +391,11 @@ async function fetchTempChunk(startDate, endDate, deadlineAt) {
         return null;
       }
       const { hostname } = new URL(mirror);
-      const url = `${mirror}/jplMURSST41.${format}?analysed_sst[(${startTs}):(${endTs})][(${BALA_LAT})][(${BALA_LON})]`;
-      console.log(`  Trying ERDDAP ${format.toUpperCase()}: ${startDate} to ${endDate} via ${hostname} (${ERDDAP_TIMEOUT_MS / 1000}s timeout)...`);
+      const mirrorEnd = await getMirrorEnd(mirror);
+      if (mirrorEnd && mirrorEnd < startDate) continue; // stale copy — has nothing in range
+      const effEnd = mirrorEnd && mirrorEnd < endDate ? mirrorEnd : endDate;
+      const url = `${mirror}/jplMURSST41.${format}?analysed_sst[(${startDate}T09:00:00Z):(${effEnd}T09:00:00Z)][(${BALA_LAT})][(${BALA_LON})]`;
+      console.log(`  Trying ERDDAP ${format.toUpperCase()}: ${startDate} to ${effEnd}${effEnd !== endDate ? ' (clamped to mirror end)' : ''} via ${hostname}...`);
       try {
         const resp = await fetch(url, { signal: AbortSignal.timeout(ERDDAP_TIMEOUT_MS) });
         if (!resp.ok) {
@@ -434,7 +470,7 @@ async function fetchHistoricalWaterTemp() {
       // ERDDAP failed entirely — inch forward via NCEI, one day at a time,
       // starting at the gap's oldest day so the cache stays contiguous.
       // Guarantees recent years keep filling in even if ERDDAP is down for weeks.
-      let nceiEnd = addDays(startDate, NCEI_MAX_GAP_DAYS - 1);
+      let nceiEnd = addDays(startDate, (fetchOnly ? 400 : NCEI_MAX_GAP_DAYS) - 1);
       if (nceiEnd > endDate) nceiEnd = endDate;
       console.log(`  ERDDAP down — filling ${startDate}..${nceiEnd} from NCEI THREDDS...`);
       for (let d = startDate; d <= nceiEnd && Date.now() < deadlineAt; d = addDays(d, 1)) {
@@ -448,7 +484,11 @@ async function fetchHistoricalWaterTemp() {
     }
     for (const r of records) byDate.set(r.date, r);
     await save();
-    startDate = addDays(chunkEnd, 1);
+    // A stale mirror may return less than the requested range — advance by
+    // what actually arrived so the remainder is retried (or handed to NCEI)
+    const lastFetched = records.reduce((m, r) => (r.date > m ? r.date : m), records[0].date);
+    if (lastFetched < startDate) break; // no forward progress
+    startDate = addDays(lastFetched, 1);
   }
 
   // 2. Head: extend backward from the oldest cached day toward BACKFILL_START,
