@@ -89,7 +89,7 @@ const ERDDAP_TIMEOUT_MS = 20000;
 const ERDDAP_DEADLINE_MS = 6 * 60 * 1000; // total time budget for historical backfill
 const BACKFILL_START = '2002-06-01';      // MUR SST v4.1 starts here — earliest available
 const BACKFILL_CHUNK_DAYS = 200;          // ERDDAP reads one file per day server-side; keep queries small
-const BACKFILL_MAX_CHUNKS = 4;            // per run; cache catches up across daily runs
+const BACKFILL_MAX_CHUNKS = 6;            // per run; cache catches up across daily runs
 const OGC_TIMEOUT_MS = 15000;
 const OUTLIER_THRESHOLD_M = 0.5;
 
@@ -431,18 +431,19 @@ async function fetchHistoricalWaterTemp() {
     chunksUsed++;
     const records = await fetchTempChunk(startDate, chunkEnd, deadlineAt);
     if (!records) {
-      // ERDDAP failed entirely. If the remaining gap is small (the normal
-      // case once the cache is seeded), fill it one day at a time from NCEI.
-      const gapDays = Math.round((new Date(endDate) - new Date(startDate)) / 86400000) + 1;
-      if (gapDays <= NCEI_MAX_GAP_DAYS) {
-        console.log(`  Topping up ${gapDays}-day gap from NCEI THREDDS...`);
-        for (let d = startDate; d <= endDate && Date.now() < deadlineAt; d = addDays(d, 1)) {
-          const point = await fetchMurPointNCEI(d);
-          if (point) byDate.set(point.date, toRecord(point.date, point.tempC));
-          await new Promise(r => setTimeout(r, 100));
-        }
-        if (byDate.size > cached.length) await save();
+      // ERDDAP failed entirely — inch forward via NCEI, one day at a time,
+      // starting at the gap's oldest day so the cache stays contiguous.
+      // Guarantees recent years keep filling in even if ERDDAP is down for weeks.
+      let nceiEnd = addDays(startDate, NCEI_MAX_GAP_DAYS - 1);
+      if (nceiEnd > endDate) nceiEnd = endDate;
+      console.log(`  ERDDAP down — filling ${startDate}..${nceiEnd} from NCEI THREDDS...`);
+      for (let d = startDate; d <= nceiEnd && Date.now() < deadlineAt; d = addDays(d, 1)) {
+        const point = await fetchMurPointNCEI(d);
+        if (!point) break; // stop at the first hole to stay contiguous
+        byDate.set(point.date, toRecord(point.date, point.tempC));
+        await new Promise(r => setTimeout(r, 100));
       }
+      if (byDate.size > cached.length) await save();
       break; // stop so the cache never develops interior gaps
     }
     for (const r of records) byDate.set(r.date, r);
@@ -451,9 +452,12 @@ async function fetchHistoricalWaterTemp() {
   }
 
   // 2. Head: extend backward from the oldest cached day toward BACKFILL_START,
-  //    newest chunk first so the cached block always stays contiguous
+  //    newest chunk first so the cached block always stays contiguous. Only
+  //    runs once the tail is fully caught up — recent years matter more than
+  //    old ones, and a flaky tail chunk must not divert the budget backwards.
+  const tailComplete = startDate > endDate;
   let earliest = all.length > 0 ? all[0].date : null;
-  while (earliest && earliest > BACKFILL_START && chunksUsed < maxChunks && Date.now() < deadlineAt) {
+  while (tailComplete && earliest && earliest > BACKFILL_START && chunksUsed < maxChunks && Date.now() < deadlineAt) {
     const chunkEnd = addDays(earliest, -1);
     let chunkStart = addDays(chunkEnd, -(BACKFILL_CHUNK_DAYS - 1));
     if (chunkStart < BACKFILL_START) chunkStart = BACKFILL_START;
@@ -494,9 +498,16 @@ async function buildTempSpaghettiChart(records) {
   const prevYear = currentYear - 1;
 
   const datasets = years.map(year => {
-    const data = byYear[year]
-      .sort((a, b) => a.dayOfYear - b.dayOfYear)
-      .map(r => ({ x: r.dayOfYear, y: r.tempC }));
+    const sorted = byYear[year].sort((a, b) => a.dayOfYear - b.dayOfYear);
+    // Insert a null point at holes > 5 days so the line breaks (spanGaps is
+    // off) instead of drawing a misleading straight jump across the gap
+    const data = [];
+    for (let i = 0; i < sorted.length; i++) {
+      if (i > 0 && sorted[i].dayOfYear - sorted[i - 1].dayOfYear > 5) {
+        data.push({ x: sorted[i - 1].dayOfYear + 1, y: null });
+      }
+      data.push({ x: sorted[i].dayOfYear, y: sorted[i].tempC });
+    }
 
     let color, width, order;
     if (year === currentYear) {
@@ -624,6 +635,7 @@ function buildWaterLevelChart(name, label, days, stJulyAvg, isFirst, stationId) 
   const chartDays = lastCalendarDays(days, CHART_DAYS);
   if (chartDays.length === 0) return null;
   const hwm = stationId ? HIGH_WATER_MARKS[stationId] : null;
+  const barPx = Math.min(16, Math.max(3, Math.floor(440 / chartDays.length)));
 
   const latest = chartDays[chartDays.length - 1];
   const vsJulyStr = stJulyAvg !== null
@@ -645,7 +657,7 @@ function buildWaterLevelChart(name, label, days, stJulyAvg, isFirst, stationId) 
     const pct = (d.value - minVal) / range;
     const height = Math.max(CHART_MIN_BAR_PX, Math.round(pct * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
     const color = i === chartDays.length - 1 ? '#E07B4C' : '#4A9BD9';
-    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:4px;height:${height}px;background:${color};border-radius:1px;"></div></td>`;
+    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:${barPx}px;height:${height}px;background:${color};border-radius:1px;"></div></td>`;
   }).join('');
 
   let refLines = '';
@@ -710,6 +722,7 @@ function buildSpreadChart(balaDays, balaJulyAvg, beauDays, beauJulyAvg) {
   const chartDays = lastCalendarDays(spreadDays, CHART_DAYS);
   if (chartDays.length === 0) return null;
   const latestSpread = chartDays[chartDays.length - 1].spread;
+  const barPx = Math.min(16, Math.max(3, Math.floor(440 / chartDays.length)));
 
   const values = chartDays.map(d => d.spread);
   const minVal = Math.min(...values, 0) - 0.5;
@@ -724,7 +737,7 @@ function buildSpreadChart(balaDays, balaJulyAvg, beauDays, beauJulyAvg) {
     const pct = (d.spread - minVal) / range;
     const height = Math.max(CHART_MIN_BAR_PX, Math.round(pct * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
     const color = d.spread >= 0 ? '#4A9BD9' : '#E07B4C';
-    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:4px;height:${height}px;background:${color};border-radius:1px;"></div></td>`;
+    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:${barPx}px;height:${height}px;background:${color};border-radius:1px;"></div></td>`;
   }).join('');
 
   const zeroPx = Math.max(1, Math.round(((0 - minVal) / range) * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
@@ -759,6 +772,7 @@ function buildFlowChart(name, label, days, isFirst) {
   if (!days || days.length === 0) return '';
   const chartDays = lastCalendarDays(days, CHART_DAYS);
   if (chartDays.length === 0) return '';
+  const barPx = Math.min(16, Math.max(3, Math.floor(440 / chartDays.length)));
   const minVal = Math.min(...chartDays.map(d => d.value));
   const maxVal = Math.max(...chartDays.map(d => d.value));
   const range = maxVal - minVal || CHART_MIN_RANGE;
@@ -767,7 +781,7 @@ function buildFlowChart(name, label, days, isFirst) {
     const pct = (d.value - minVal) / range;
     const height = Math.max(CHART_MIN_BAR_PX, Math.round(pct * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
     const color = i === chartDays.length - 1 ? '#E07B4C' : '#6B8EAD';
-    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:4px;height:${height}px;background:${color};border-radius:1px;" title="${d.date}: ${d.value.toFixed(1)} m³/s"></div></td>`;
+    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:${barPx}px;height:${height}px;background:${color};border-radius:1px;" title="${d.date}: ${d.value.toFixed(1)} m³/s"></div></td>`;
   }).join('');
 
   const firstDate = chartDays[0];
@@ -986,9 +1000,10 @@ async function main() {
     fetchHistoricalWaterTemp(),
   ]);
   const tempF = waterTemp ? Math.round(waterTemp.tempC * 9 / 5 + 32) : null;
-  const tempMinYear = historicalTempRecords && historicalTempRecords.length > 0
-    ? historicalTempRecords[0].year
-    : null;
+  const tempYears = historicalTempRecords ? [...new Set(historicalTempRecords.map(r => r.year))] : [];
+  const tempGreyYears = tempYears.filter(y => y <= CURRENT_YEAR - 2);
+  const tempMinYear = tempGreyYears.length > 0 ? Math.min(...tempGreyYears) : null;
+  const tempMaxGreyYear = tempGreyYears.length > 0 ? Math.max(...tempGreyYears) : null;
   if (waterTemp) {
     console.log(`  Water temp: ${waterTemp.tempC}°C (${tempF}°F) — ${waterTemp.date}`);
   } else {
@@ -1212,7 +1227,7 @@ async function main() {
         <div style="margin-top:6px;font-size:9px;color:#999;">
           <span style="display:inline-block;width:16px;border-top:2.5px solid #2D6A9F;vertical-align:middle;margin-right:4px;"></span>${CURRENT_YEAR} YTD
           <span style="display:inline-block;width:16px;border-top:2px solid #C0392B;vertical-align:middle;margin-left:10px;margin-right:4px;"></span>${CURRENT_YEAR - 1}
-          ${tempMinYear !== null && tempMinYear <= CURRENT_YEAR - 2 ? `<span style="display:inline-block;width:16px;border-top:1px solid rgba(150,150,150,0.7);vertical-align:middle;margin-left:10px;margin-right:4px;"></span>${tempMinYear < CURRENT_YEAR - 2 ? `${tempMinYear}\u2013${CURRENT_YEAR - 2}` : CURRENT_YEAR - 2}` : ''}
+          ${tempMinYear !== null && tempMinYear <= CURRENT_YEAR - 2 ? `<span style="display:inline-block;width:16px;border-top:1px solid rgba(150,150,150,0.7);vertical-align:middle;margin-left:10px;margin-right:4px;"></span>${tempMinYear < tempMaxGreyYear ? `${tempMinYear}\u2013${tempMaxGreyYear}` : tempMaxGreyYear}` : ''}
         </div>
         <div style="font-size:8px;color:#BBB;margin-top:2px;">Source: NOAA MUR SST v4.1</div>
       </div>
