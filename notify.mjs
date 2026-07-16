@@ -60,12 +60,14 @@ const FLOW_STATIONS = [
 // Bala Bay coordinates for satellite SST lookup
 const BALA_LAT = 45.01;
 const BALA_LON = -79.6;
+// Confirmed 2026-07-14 from a residential IP: USF and the two PFEG servers all
+// serve jplMURSST41 through the present. polarwatch (404) and spraydata (400)
+// no longer host it and were dropped. USF first — it's a dedicated mirror and
+// answers the quick metadata probe fastest.
 const ERDDAP_MIRRORS = [
-  'https://polarwatch.noaa.gov/erddap/griddap',   // sometimes 404s while its copy reloads
-  'https://spraydata.ucsd.edu/erddap/griddap',    // Scripps
   'https://erddap.marine.usf.edu/erddap/griddap', // USF
-  // PFEG origin servers last: their blacklist covers GitHub runner IPs when
-  // active, but they always work from residential IPs (--fetch-only)
+  // PFEG origin servers: their blacklist covers GitHub runner IPs when active,
+  // but they always work from residential IPs (--fetch-only)
   'https://coastwatch.pfeg.noaa.gov/erddap/griddap',
   'https://upwell.pfeg.noaa.gov/erddap/griddap',
 ];
@@ -85,11 +87,12 @@ const CHART_DAYS = 90;  // trailing calendar-day window for level/flow charts
 const CHART_HEIGHT_PX = 120;
 const CHART_MIN_BAR_PX = 3;
 const CHART_MIN_RANGE = 0.01;
-const ERDDAP_TIMEOUT_MS = 20000;
+const ERDDAP_TIMEOUT_MS = 20000;          // quick metadata probe (time[(last)])
+const ERDDAP_DATA_TIMEOUT_MS = 90000;     // range extraction — MUR point time-series is slow (one file/day server-side)
 const ERDDAP_DEADLINE_MS = 6 * 60 * 1000; // total time budget for historical backfill
 const BACKFILL_START = '2002-06-01';      // MUR SST v4.1 starts here — earliest available
-const BACKFILL_CHUNK_DAYS = 200;          // ERDDAP reads one file per day server-side; keep queries small
-const BACKFILL_MAX_CHUNKS = 6;            // per run; cache catches up across daily runs
+const BACKFILL_CHUNK_DAYS = 45;           // small chunks so each extraction finishes inside the timeout
+const BACKFILL_MAX_CHUNKS = 8;            // per run; cache catches up across daily runs
 const OGC_TIMEOUT_MS = 15000;
 const OUTLIER_THRESHOLD_M = 0.5;
 
@@ -379,6 +382,10 @@ async function getMirrorEnd(mirror) {
   return end;
 }
 
+// Mirrors that time out on a data request are skipped for the rest of the run
+// so one slow server can't burn the whole budget across every chunk.
+const timedOutMirrors = new Set();
+
 // Fetch one date range from ERDDAP, trying CSV then JSON across all mirrors.
 // A stale mirror is used for whatever part of the range it has — the caller
 // advances by the dates actually returned. Returns records[] on success,
@@ -390,6 +397,7 @@ async function fetchTempChunk(startDate, endDate, deadlineAt) {
         console.log('  ERDDAP time budget exhausted');
         return null;
       }
+      if (timedOutMirrors.has(mirror)) continue;
       const { hostname } = new URL(mirror);
       const mirrorEnd = await getMirrorEnd(mirror);
       if (mirrorEnd && mirrorEnd < startDate) continue; // stale copy — has nothing in range
@@ -397,7 +405,7 @@ async function fetchTempChunk(startDate, endDate, deadlineAt) {
       const url = `${mirror}/jplMURSST41.${format}?analysed_sst[(${startDate}T09:00:00Z):(${effEnd}T09:00:00Z)][(${BALA_LAT})][(${BALA_LON})]`;
       console.log(`  Trying ERDDAP ${format.toUpperCase()}: ${startDate} to ${effEnd}${effEnd !== endDate ? ' (clamped to mirror end)' : ''} via ${hostname}...`);
       try {
-        const resp = await fetch(url, { signal: AbortSignal.timeout(ERDDAP_TIMEOUT_MS) });
+        const resp = await fetch(url, { signal: AbortSignal.timeout(ERDDAP_DATA_TIMEOUT_MS) });
         if (!resp.ok) {
           const errBody = await resp.text().catch(() => '');
           console.log(`  ERDDAP HTTP ${resp.status} (final URL: ${resp.url}): ${errBody.substring(0, 200)}`);
@@ -424,6 +432,10 @@ async function fetchTempChunk(startDate, endDate, deadlineAt) {
         console.log(`  ERDDAP returned no records via ${hostname}`);
       } catch (e) {
         console.log(`  ERDDAP ${format.toUpperCase()} failed (${hostname}): ${e.message}`);
+        if (e.name === 'TimeoutError' || /timeout/i.test(e.message)) {
+          timedOutMirrors.add(mirror);
+          console.log(`  ${hostname} timed out — skipping it for the rest of this run`);
+        }
       }
     }
   }
@@ -443,10 +455,12 @@ async function fetchHistoricalWaterTemp() {
   // MUR SST data lags ~2 days behind real-time
   const endDate = addDays(TODAY_ISO, -3);
 
-  // --fetch-only runs (seeding from an unblocked IP) get a much bigger budget
+  // --fetch-only runs (seeding from an unblocked IP) get a much bigger budget.
+  // Either way the run resumes from the cache next time, so a cutoff just means
+  // "run it again to continue".
   const fetchOnly = process.argv.includes('--fetch-only');
-  const maxChunks = fetchOnly ? 60 : BACKFILL_MAX_CHUNKS;
-  const deadlineAt = Date.now() + (fetchOnly ? 5 : 1) * ERDDAP_DEADLINE_MS;
+  const maxChunks = fetchOnly ? 120 : BACKFILL_MAX_CHUNKS;
+  const deadlineAt = Date.now() + (fetchOnly ? 8 : 1) * ERDDAP_DEADLINE_MS;
 
   const byDate = new Map(cached.map(r => [r.date, r]));
   let all = cached;
