@@ -538,7 +538,7 @@ async function fetchHistoricalWaterTemp() {
 
 // ── Build water temperature spaghetti chart (year-over-year overlay) ──
 
-async function buildTempSpaghettiChart(records) {
+async function buildTempSpaghettiChart(records, waterTemp) {
   if (!records || records.length === 0) return null;
 
   const byYear = {};
@@ -590,6 +590,21 @@ async function buildTempSpaghettiChart(records) {
       order,
     };
   });
+
+  // Highlight the actual "today" reading — the current-year line's own
+  // endpoint isn't reliably readable as "today" once 20+ years overlap it
+  if (waterTemp) {
+    datasets.push({
+      label: 'Today',
+      data: [{ x: toRecord(waterTemp.date, 0).dayOfYear, y: waterTemp.tempC }],
+      showLine: false,
+      pointRadius: 5,
+      pointBackgroundColor: '#2D6A9F',
+      pointBorderColor: '#FFFFFF',
+      pointBorderWidth: 1.5,
+      order: -1,
+    });
+  }
 
   // Sort so current year renders on top (lowest order = drawn last = on top)
   datasets.sort((a, b) => b.order - a.order);
@@ -722,19 +737,32 @@ function computeTodayTempStats(records, todayDate, todayTempC) {
   }
   const yearAverages = [...byYear.values()].map(vals => vals.reduce((a, b) => a + b, 0) / vals.length);
   const rank = 1 + yearAverages.filter(v => v > todayTempC).length;
+  const poolYears = [...byYear.keys()];
 
-  return { min, max, median: med, rank, totalYears: yearAverages.length + 1 };
+  return {
+    min, max, median: med, rank,
+    totalYears: yearAverages.length + 1,
+    windowStart: addDays(todayDate, -3),
+    windowEnd: addDays(todayDate, 3),
+    earliestYear: Math.min(...poolYears),
+    latestYear: Math.max(...poolYears),
+  };
 }
 
 // ── Build water temperature YTD anomaly chart (actual vs historical median) ──
 
-async function buildTempAnomalyChart(records, todayDayOfYear) {
+async function buildTempAnomalyChart(records) {
   if (!records || records.length === 0) return null;
 
   const currentYearByDay = new Map(
     records.filter(r => r.year === CURRENT_YEAR).map(r => [r.dayOfYear, r.tempC])
   );
   if (currentYearByDay.size === 0) return null;
+
+  // Bound the chart to the last day of data actually present — the cache is
+  // always at least a few days behind real "today" (satellite processing
+  // lag), so using real today here would reserve blank trailing space.
+  const lastDataDay = Math.max(...currentYearByDay.keys());
 
   // Bucket every non-current-year reading by its own day-of-year once, then
   // union ±3 buckets per target day instead of re-filtering ~6800 rows per day.
@@ -755,7 +783,7 @@ async function buildTempAnomalyChart(records, todayDayOfYear) {
   };
 
   const data = [];
-  for (let day = 1; day <= todayDayOfYear; day++) {
+  for (let day = 1; day <= lastDataDay; day++) {
     const actual = currentYearByDay.get(day);
     const baseline = windowedMedian(day);
     data.push({ x: day, y: (actual !== undefined && baseline !== null) ? actual - baseline : null });
@@ -773,7 +801,7 @@ async function buildTempAnomalyChart(records, todayDayOfYear) {
   const allMonthStarts = [1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335];
   const allMonthLabels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   const monthLabelByStart = new Map(allMonthStarts.map((v, i) => [v, allMonthLabels[i]]));
-  const monthStarts = allMonthStarts.filter(m => m <= todayDayOfYear);
+  const monthStarts = allMonthStarts.filter(m => m <= lastDataDay);
 
   const config = {
     type: 'bar',
@@ -793,7 +821,7 @@ async function buildTempAnomalyChart(records, todayDayOfYear) {
         x: {
           type: 'linear',
           min: 1,
-          max: Math.max(todayDayOfYear, 1),
+          max: Math.max(lastDataDay, 1),
           afterBuildTicks: (axis) => {
             axis.ticks = monthStarts.map(value => ({ value }));
           },
@@ -1316,7 +1344,7 @@ async function main() {
   let tempChartBuffer = null;
   try {
     if (historicalTempRecords && historicalTempRecords.length > 0) {
-      tempChartBuffer = await buildTempSpaghettiChart(historicalTempRecords);
+      tempChartBuffer = await buildTempSpaghettiChart(historicalTempRecords, waterTemp);
     }
   } catch (e) {
     console.log(`  Spaghetti chart generation failed: ${e.message}`);
@@ -1326,8 +1354,7 @@ async function main() {
   let tempAnomalyChartBuffer = null;
   try {
     if (historicalTempRecords && historicalTempRecords.length > 0) {
-      const todayDayOfYear = toRecord(TODAY_ISO, 0).dayOfYear;
-      tempAnomalyChartBuffer = await buildTempAnomalyChart(historicalTempRecords, todayDayOfYear);
+      tempAnomalyChartBuffer = await buildTempAnomalyChart(historicalTempRecords);
     }
   } catch (e) {
     console.log(`  Anomaly chart generation failed: ${e.message}`);
@@ -1459,11 +1486,11 @@ async function main() {
       ${waterTemp ? `
       <!-- Water Temperature -->
       <div style="margin-bottom:16px;">
-        <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:4px;">Water Temperature</div>
+        <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:4px;">Water Temperature — ${fmtShort({ date: waterTemp.date })}</div>
         <div style="font-size:28px;font-weight:700;color:#0B1D33;">${waterTemp.tempC.toFixed(1)}<span style="font-size:14px;color:#6B6B6B;margin-left:2px;">°C</span> <span style="font-size:16px;font-weight:400;color:#6B6B6B;">(${tempF}°F)</span></div>
         ${todayTempStats ? `
         <div style="font-size:12px;color:#6B6B6B;margin-top:4px;">
-          This week historically: ${todayTempStats.min.toFixed(1)}–${todayTempStats.max.toFixed(1)}°C (median ${todayTempStats.median.toFixed(1)}°C) · today ranks <strong style="color:#0B1D33;">${ordinal(todayTempStats.rank)} warmest</strong> of ${todayTempStats.totalYears} years on record
+          ${fmtShort({ date: todayTempStats.windowStart })}–${fmtShort({ date: todayTempStats.windowEnd })} historically: ${todayTempStats.min.toFixed(1)}–${todayTempStats.max.toFixed(1)}°C (median ${todayTempStats.median.toFixed(1)}°C) across ${todayTempStats.earliestYear}–${todayTempStats.latestYear} · ranks <strong style="color:#0B1D33;">${ordinal(todayTempStats.rank)} warmest</strong> of ${todayTempStats.totalYears} years on record
         </div>
         ` : ''}
       </div>
@@ -1474,7 +1501,8 @@ async function main() {
       <div style="margin-bottom:16px;">
         <img src="cid:temp-chart" alt="Water temperature year-over-year chart" style="width:100%;max-width:560px;height:auto;border-radius:8px;border:1px solid #E0DAD2;display:block;" />
         <div style="margin-top:6px;font-size:9px;color:#999;">
-          <span style="display:inline-block;width:16px;border-top:2.5px solid #2D6A9F;vertical-align:middle;margin-right:4px;"></span>${CURRENT_YEAR} YTD
+          ${waterTemp ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#2D6A9F;vertical-align:middle;margin-right:4px;"></span>Today (${fmtShort({ date: waterTemp.date })})` : ''}
+          <span style="display:inline-block;width:16px;border-top:2.5px solid #2D6A9F;vertical-align:middle;margin-left:${waterTemp ? '10px' : '0'};margin-right:4px;"></span>${CURRENT_YEAR} YTD
           <span style="display:inline-block;width:16px;border-top:2px solid #C0392B;vertical-align:middle;margin-left:10px;margin-right:4px;"></span>${CURRENT_YEAR - 1}
           ${tempMinYear !== null && tempMinYear <= CURRENT_YEAR - 2 ? `<span style="display:inline-block;width:16px;border-top:1px solid rgba(150,150,150,0.7);vertical-align:middle;margin-left:10px;margin-right:4px;"></span>${tempMinYear < tempMaxGreyYear ? `${tempMinYear}\u2013${tempMaxGreyYear}` : tempMaxGreyYear}` : ''}
         </div>
@@ -1544,8 +1572,8 @@ async function main() {
     `🌊 Bala Bay Water Level — ${dateStr}`,
     ``,
     `Current: ${deltaSign}${deltaIn?.toFixed(1) ?? '?'} in vs July avg`,
-    waterTemp ? `Water temp: ${waterTemp.tempC.toFixed(1)}°C (${tempF}°F)` : '',
-    todayTempStats ? `  This week historically: ${todayTempStats.min.toFixed(1)}-${todayTempStats.max.toFixed(1)}°C (median ${todayTempStats.median.toFixed(1)}°C) — today ranks ${ordinal(todayTempStats.rank)} warmest of ${todayTempStats.totalYears} years on record` : '',
+    waterTemp ? `Water temp (${fmtShort({ date: waterTemp.date })}): ${waterTemp.tempC.toFixed(1)}°C (${tempF}°F)` : '',
+    todayTempStats ? `  ${fmtShort({ date: todayTempStats.windowStart })}-${fmtShort({ date: todayTempStats.windowEnd })} historically: ${todayTempStats.min.toFixed(1)}-${todayTempStats.max.toFixed(1)}°C (median ${todayTempStats.median.toFixed(1)}°C) across ${todayTempStats.earliestYear}-${todayTempStats.latestYear} — ranks ${ordinal(todayTempStats.rank)} warmest of ${todayTempStats.totalYears} years on record` : '',
     julyAvg !== null ? `${deltaNote}` : '',
     trend !== null ? `7-day trend: ${trendIn > 0 ? '+' : ''}${trendIn.toFixed(1)} in ${trendArrow}` : '',
     ``,
