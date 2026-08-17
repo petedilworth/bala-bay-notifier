@@ -749,6 +749,49 @@ function computeTodayTempStats(records, todayDate, todayTempC) {
   };
 }
 
+// Median expected change in water temperature over the next 7 days, based on
+// what happened historically between this day-of-year and 7 days later.
+// Compares ±2-day pooled averages (anchor vs anchor+7) per year, then takes
+// the median delta across all years on record.
+function computeNextWeekTempForecast(records, todayDate, todayTempC) {
+  const todayRecord = toRecord(todayDate, todayTempC);
+  const futureDayOfYear = ((todayRecord.dayOfYear - 1 + 7) % 366) + 1;
+
+  const anchorPool = poolAroundDay(records, todayRecord.dayOfYear, 2, CURRENT_YEAR);
+  const futurePool = poolAroundDay(records, futureDayOfYear, 2, CURRENT_YEAR);
+  if (anchorPool.length === 0 || futurePool.length === 0) return null;
+
+  // Per-year average for each window, then per-year delta (future - anchor).
+  const avgByYear = (pool) => {
+    const byYear = new Map();
+    for (const r of pool) {
+      if (!byYear.has(r.year)) byYear.set(r.year, []);
+      byYear.get(r.year).push(r.tempC);
+    }
+    const out = new Map();
+    for (const [year, vals] of byYear) out.set(year, vals.reduce((a, b) => a + b, 0) / vals.length);
+    return out;
+  };
+  const anchorByYear = avgByYear(anchorPool);
+  const futureByYear = avgByYear(futurePool);
+
+  const deltas = [];
+  for (const [year, anchorAvg] of anchorByYear) {
+    if (futureByYear.has(year)) deltas.push(futureByYear.get(year) - anchorAvg);
+  }
+  if (deltas.length === 0) return null;
+
+  const expectedChange = median(deltas);
+  const direction = expectedChange > 0.15 ? 'warm' : expectedChange < -0.15 ? 'cool' : 'hold steady';
+
+  return {
+    expectedChange,             // °C, signed
+    direction,                  // 'warm' | 'cool' | 'hold steady'
+    yearsUsed: deltas.length,
+    futureDate: addDays(todayDate, 7),
+  };
+}
+
 // ── Build water temperature YTD anomaly chart (actual vs historical median) ──
 
 async function buildTempAnomalyChart(records) {
@@ -1264,10 +1307,16 @@ async function main() {
   }
 
   let todayTempStats = null;
+  let nextWeekTempForecast = null;
   if (waterTemp && historicalTempRecords && historicalTempRecords.length > 0) {
     todayTempStats = computeTodayTempStats(historicalTempRecords, waterTemp.date, waterTemp.tempC);
     if (todayTempStats) {
       console.log(`  This time of year: ${todayTempStats.min.toFixed(1)}–${todayTempStats.max.toFixed(1)}°C (median ${todayTempStats.median.toFixed(1)}°C), today ranks ${ordinal(todayTempStats.rank)} warmest of ${todayTempStats.totalYears}`);
+    }
+    nextWeekTempForecast = computeNextWeekTempForecast(historicalTempRecords, waterTemp.date, waterTemp.tempC);
+    if (nextWeekTempForecast) {
+      const changeStr = nextWeekTempForecast.direction !== 'hold steady' ? ` ~${Math.abs(nextWeekTempForecast.expectedChange).toFixed(1)}°C` : '';
+      console.log(`  Next 7 days: median temp expected to ${nextWeekTempForecast.direction}${changeStr} (${nextWeekTempForecast.yearsUsed}-yr pattern)`);
     }
   }
 
@@ -1490,7 +1539,7 @@ async function main() {
         <div style="font-size:28px;font-weight:700;color:#0B1D33;">${waterTemp.tempC.toFixed(1)}<span style="font-size:14px;color:#6B6B6B;margin-left:2px;">°C</span> <span style="font-size:16px;font-weight:400;color:#6B6B6B;">(${tempF}°F)</span></div>
         ${todayTempStats ? `
         <div style="font-size:12px;color:#6B6B6B;margin-top:4px;">
-          ${fmtShort({ date: todayTempStats.windowStart })}–${fmtShort({ date: todayTempStats.windowEnd })} historically: ${todayTempStats.min.toFixed(1)}–${todayTempStats.max.toFixed(1)}°C (median ${todayTempStats.median.toFixed(1)}°C) across ${todayTempStats.earliestYear}–${todayTempStats.latestYear} · ranks <strong style="color:#0B1D33;">${ordinal(todayTempStats.rank)} warmest</strong> of ${todayTempStats.totalYears} years on record
+          ${fmtShort({ date: todayTempStats.windowStart })}–${fmtShort({ date: todayTempStats.windowEnd })} historically: ${todayTempStats.min.toFixed(1)}–${todayTempStats.max.toFixed(1)}°C (median ${todayTempStats.median.toFixed(1)}°C) across ${todayTempStats.earliestYear}–${todayTempStats.latestYear} · ranks <strong style="color:#0B1D33;">${ordinal(todayTempStats.rank)} warmest</strong> of ${todayTempStats.totalYears} years on record${nextWeekTempForecast ? ` · median temp expected to <strong style="color:#0B1D33;">${nextWeekTempForecast.direction}</strong>${nextWeekTempForecast.direction !== 'hold steady' ? ` ~${Math.abs(nextWeekTempForecast.expectedChange).toFixed(1)}°C` : ''} over the next 7 days (${nextWeekTempForecast.yearsUsed}-yr pattern)` : ''}
         </div>
         ` : ''}
       </div>
@@ -1573,7 +1622,7 @@ async function main() {
     ``,
     `Current: ${deltaSign}${deltaIn?.toFixed(1) ?? '?'} in vs July avg`,
     waterTemp ? `Water temp (${fmtShort({ date: waterTemp.date })}): ${waterTemp.tempC.toFixed(1)}°C (${tempF}°F)` : '',
-    todayTempStats ? `  ${fmtShort({ date: todayTempStats.windowStart })}-${fmtShort({ date: todayTempStats.windowEnd })} historically: ${todayTempStats.min.toFixed(1)}-${todayTempStats.max.toFixed(1)}°C (median ${todayTempStats.median.toFixed(1)}°C) across ${todayTempStats.earliestYear}-${todayTempStats.latestYear} — ranks ${ordinal(todayTempStats.rank)} warmest of ${todayTempStats.totalYears} years on record` : '',
+    todayTempStats ? `  ${fmtShort({ date: todayTempStats.windowStart })}-${fmtShort({ date: todayTempStats.windowEnd })} historically: ${todayTempStats.min.toFixed(1)}-${todayTempStats.max.toFixed(1)}°C (median ${todayTempStats.median.toFixed(1)}°C) across ${todayTempStats.earliestYear}-${todayTempStats.latestYear} — ranks ${ordinal(todayTempStats.rank)} warmest of ${todayTempStats.totalYears} years on record${nextWeekTempForecast ? ` — median temp expected to ${nextWeekTempForecast.direction}${nextWeekTempForecast.direction !== 'hold steady' ? ` ~${Math.abs(nextWeekTempForecast.expectedChange).toFixed(1)}°C` : ''} over next 7 days (${nextWeekTempForecast.yearsUsed}-yr pattern)` : ''}` : '',
     julyAvg !== null ? `${deltaNote}` : '',
     trend !== null ? `7-day trend: ${trendIn > 0 ? '+' : ''}${trendIn.toFixed(1)} in ${trendArrow}` : '',
     ``,
