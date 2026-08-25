@@ -922,6 +922,33 @@ function lastCalendarDays(days, n) {
   return days.filter(d => d.date >= cutoff);
 }
 
+function daysBetween(laterDate, earlierDate) {
+  return Math.round(
+    (new Date(laterDate + 'T12:00:00Z') - new Date(earlierDate + 'T12:00:00Z')) / 86400000
+  );
+}
+
+// The reading closest to n days before the series' newest date. Indexing by row
+// (days[len - 1 - n]) silently means something else whenever the series has
+// interior holes — and it does: an API outage left a 158-day gap in the cache,
+// so "7 rows back" can be months back. Returns null when nothing lands within
+// `tolerance` days of the target, so callers omit the metric instead of
+// reporting a bogus one.
+function readingNDaysBack(days, n, tolerance = 3) {
+  if (!days || days.length === 0) return null;
+  const target = addDays(days[days.length - 1].date, -n);
+  let best = null;
+  let bestDiff = Infinity;
+  for (const d of days) {
+    const diff = Math.abs(daysBetween(d.date, target));
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = d;
+    }
+  }
+  return bestDiff <= tolerance ? best : null;
+}
+
 function fmtShort(d) {
   return new Date(d.date + 'T12:00:00').toLocaleDateString('en-CA', { month: 'short', day: 'numeric' });
 }
@@ -1240,9 +1267,15 @@ async function main() {
     return;
   }
 
+  // Dry-run mode: build the email and write it to disk instead of sending, so
+  // template changes can be previewed locally without secrets (or a live send).
+  const dryRun = process.argv.includes('--dry-run');
+
   // Validate config
-  if (!RESEND_API_KEY) throw new Error('Missing RESEND_API_KEY');
-  if (EMAIL_TO.length === 0) throw new Error('Missing EMAIL_TO');
+  if (!dryRun) {
+    if (!RESEND_API_KEY) throw new Error('Missing RESEND_API_KEY');
+    if (EMAIL_TO.length === 0) throw new Error('Missing EMAIL_TO');
+  }
 
   // 1. Fetch Bala station data (realtime + 5-year daily-mean history).
   console.log(`Fetching Bala station data (${STATION})...`);
@@ -1261,12 +1294,14 @@ async function main() {
   let trend = null;
   let trendIn = null;
   let trendArrow = '';
-  if (recentData.length >= 7) {
-    const weekAgo = recentData[recentData.length - 7];
+  const weekAgo = readingNDaysBack(recentData, 7);
+  if (weekAgo) {
     trend = (latest.value - weekAgo.value) * 100; // in cm
     trendIn = trend / CM_PER_INCH; // in inches
     trendArrow = trend > 0.5 ? '↗ rising' : trend < -0.5 ? '↘ falling' : '→ stable';
-    console.log(`  7-day trend: ${trendIn > 0 ? '+' : ''}${trendIn.toFixed(1)}in (${trendArrow})`);
+    console.log(`  7-day trend: ${trendIn > 0 ? '+' : ''}${trendIn.toFixed(1)}in (${trendArrow}) — ${weekAgo.date} → ${latest.date}`);
+  } else {
+    console.log('  7-day trend: no reading near 7 days back — skipping');
   }
 
   // 3. July average (computed from 5-year history inside fetchStationData)
@@ -1365,6 +1400,18 @@ async function main() {
     })
   );
 
+  // A gauge can go dormant and leave only old readings in the cache (02EB006
+  // stopped reporting in 2021). Its chart is empty either way, but the text
+  // body used to print that last cached row as the current flow — drop stale
+  // gauges once, here, so HTML and text agree on which ones exist.
+  const freshFlowResults = flowResults.filter(s => {
+    const fresh = s.recentDays ? lastCalendarDays(s.recentDays, CHART_DAYS) : [];
+    if (fresh.length > 0) return true;
+    const last = s.recentDays?.length ? s.recentDays[s.recentDays.length - 1].date : 'never';
+    console.log(`    ${s.name} (${s.id}) flow omitted — no reading in last ${CHART_DAYS} days (latest: ${last})`);
+    return false;
+  });
+
   // All station/flow fetches are done — persist the observation cache so the
   // workflow's data-commit step picks it up
   await saveLevelCache();
@@ -1379,7 +1426,10 @@ async function main() {
       const level = lat.value;
       const aboveLow = lowWater ? ((level - lowWater.value) * 100 / CM_PER_INCH).toFixed(2) : '';
       const belowSum = stJulyAvg !== null ? ((level - stJulyAvg) * 100 / CM_PER_INCH).toFixed(2) : '';
-      const chg = (n) => days.length > n ? (((level - days[days.length - 1 - n].value) * 100 / CM_PER_INCH).toFixed(2)) : '';
+      const chg = (n) => {
+        const prev = readingNDaysBack(days, n, 1);
+        return prev ? ((level - prev.value) * 100 / CM_PER_INCH).toFixed(2) : '';
+      };
       csvRows.push([name, label, lat.date, level.toFixed(4), stJulyAvg?.toFixed(4) ?? '', lowWater?.date ?? '', lowWater?.value.toFixed(4) ?? '', aboveLow, belowSum, chg(1), chg(2), chg(3)].join(','));
     }
     csvRow('Bala', 'Lake Muskoka', recentData, julyAvg, balaLowWater);
@@ -1415,6 +1465,14 @@ async function main() {
   const dateStr = new Date(latest.date + 'T12:00:00').toLocaleDateString('en-CA', {
     weekday: 'long', month: 'long', day: 'numeric', year: 'numeric'
   });
+
+  // Every headline number is derived from `latest`, so if the gauge feed stalls
+  // the email keeps looking current while quietly reporting old water. Say so.
+  const levelAgeDays = daysBetween(TODAY_ISO, latest.date);
+  const staleLevelNote = levelAgeDays > 2
+    ? `Latest gauge reading is ${levelAgeDays} days old — Environment Canada's feed may be lagging.`
+    : null;
+  if (staleLevelNote) console.log(`  ⚠ ${staleLevelNote}`);
 
   // Build water level charts (HTML)
   const waterLevelChartInputs = [
@@ -1521,6 +1579,7 @@ async function main() {
     <div style="margin-bottom:20px;">
       <h1 style="margin:0;font-size:20px;color:#0B1D33;">🌊 Bala Bay</h1>
       <p style="margin:4px 0 0;font-size:13px;color:#6B6B6B;">${dateStr}</p>
+      ${staleLevelNote ? `<p style="margin:6px 0 0;font-size:11px;color:#C0392B;">⚠ ${staleLevelNote}</p>` : ''}
     </div>
 
     <!-- Main card -->
@@ -1587,11 +1646,10 @@ async function main() {
       ${spreadChart ? spreadChart.html : ''}
 
       <!-- Flow Rate Charts -->
-      ${flowResults.filter(s => s.recentDays && s.recentDays.length > 0).length > 0 ? `
+      ${freshFlowResults.length > 0 ? `
       <div style="margin-top:24px;border-top:2px solid #E0DAD2;padding-top:16px;">
         <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:4px;">River Flow Rates</div>
-        ${flowResults
-          .filter(s => s.recentDays && s.recentDays.length > 0)
+        ${freshFlowResults
           .map((s, i) => buildFlowChart(s.name, s.label, s.recentDays, i === 0))
           .join('')}
       </div>
@@ -1611,14 +1669,15 @@ async function main() {
   const extraText = extraResults.filter(s => s.recentDays).map(s =>
     txtRow(s.name, s.label, s.recentDays, s.julyAvg, s.lowWater)
   ).filter(Boolean).join('\n');
-  const flowText = flowResults
-    .filter(s => s.recentDays && s.recentDays.length > 0)
+  const flowText = freshFlowResults
     .map(s => {
-      const lat = s.recentDays[s.recentDays.length - 1];
-      return `  ${s.name} (${s.label}): ${lat.value.toFixed(1)} m³/s`;
+      const fresh = lastCalendarDays(s.recentDays, CHART_DAYS);
+      const lat = fresh[fresh.length - 1];
+      return `  ${s.name} (${s.label}): ${lat.value.toFixed(1)} m³/s (${fmtShort(lat)})`;
     }).join('\n');
   const text = [
     `🌊 Bala Bay Water Level — ${dateStr}`,
+    staleLevelNote ? `⚠ ${staleLevelNote}` : '',
     ``,
     `Current: ${deltaSign}${deltaIn?.toFixed(1) ?? '?'} in vs July avg`,
     waterTemp ? `Water temp (${fmtShort({ date: waterTemp.date })}): ${waterTemp.tempC.toFixed(1)}°C (${tempF}°F)` : '',
@@ -1649,6 +1708,19 @@ async function main() {
       content: tempAnomalyChartBuffer.toString('base64'),
       content_id: 'temp-anomaly-chart',
     });
+  }
+
+  if (dryRun) {
+    // Inline the CID attachments as data: URIs so the preview renders standalone
+    const previewHtml = html
+      .replace('cid:temp-chart', tempChartBuffer ? `data:image/png;base64,${tempChartBuffer.toString('base64')}` : '')
+      .replace('cid:temp-anomaly-chart', tempAnomalyChartBuffer ? `data:image/png;base64,${tempAnomalyChartBuffer.toString('base64')}` : '');
+    await fs.writeFile(__dirname + 'preview.html', previewHtml, 'utf8');
+    await fs.writeFile(__dirname + 'preview.txt', text, 'utf8');
+    console.log('📄 Dry run — no email sent.');
+    console.log(`   Wrote preview.html (${previewHtml.length} bytes) and preview.txt`);
+    console.log(`   Charts: spaghetti=${tempChartBuffer ? 'yes' : 'no'}, anomaly=${tempAnomalyChartBuffer ? 'yes' : 'no'}`);
+    return;
   }
 
   const emailResp = await fetch('https://api.resend.com/emails', {

@@ -77,6 +77,26 @@ vs 5-Year July Average: +3.2 cm
 
 ---
 
+## Running it locally
+
+```bash
+npm install
+
+# Build the email and write preview.html / preview.txt — no secrets, no send.
+# Open preview.html in a browser to see exactly what would go out.
+node notify.mjs --dry-run
+
+# Update data/water-temp.csv only (useful for seeding history from an IP that
+# the NOAA ERDDAP mirrors haven't blocked — GitHub runner IPs often are).
+node notify.mjs --fetch-only
+```
+
+> **Note:** the daily cron always runs the **default branch** (`main`). Changes
+> pushed to a feature branch won't show up in the morning email until they're
+> merged.
+
+---
+
 ## Customization
 
 **Change the schedule:** Edit `.github/workflows/daily-notify.yml` and modify the cron expression. Use [crontab.guru](https://crontab.guru) to build the schedule.

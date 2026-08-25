@@ -1,1 +1,5 @@
 node_modules/
+
+# --dry-run output
+preview.html
+preview.txt
