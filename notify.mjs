@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ChartJSNodeCanvas } from 'chartjs-node-canvas';
 
@@ -41,13 +42,6 @@ const EXTRA_STATIONS = [
   { id: '02EB008', name: 'Baysville', label: 'S. Branch Muskoka R.' },
 ];
 
-// Historical high water marks (metres) — station ID → { level, year }
-const HIGH_WATER_MARKS = {
-  '02EB015': { level: 226.051, year: 2019 },
-  '02EB018': { level: 10.461, year: 2019 },
-  '02EB020': { level: 9.35, year: 2013 },
-};
-
 // Flow rate stations (discharge in m³/s) — WSC gauges on the rivers
 const FLOW_STATIONS = [
   { id: '02EB006', name: 'Bala', label: 'Muskoka River' },
@@ -84,9 +78,6 @@ const NCEI_MAX_GAP_DAYS = 90; // days filled per run, one at a time, when ERDDAP
 // ── Tunable constants ──
 const CM_PER_INCH = 2.54;
 const CHART_DAYS = 90;  // trailing calendar-day window for level/flow charts
-const CHART_HEIGHT_PX = 120;
-const CHART_MIN_BAR_PX = 3;
-const CHART_MIN_RANGE = 0.01;
 const ERDDAP_TIMEOUT_MS = 20000;          // quick metadata probe (time[(last)])
 const ERDDAP_DATA_TIMEOUT_MS = 90000;     // range extraction — MUR point time-series is slow (one file/day server-side)
 const ERDDAP_DEADLINE_MS = 6 * 60 * 1000; // total time budget for historical backfill
@@ -953,83 +944,171 @@ function fmtShort(d) {
   return new Date(d.date + 'T12:00:00').toLocaleDateString('en-CA', { month: 'short', day: 'numeric' });
 }
 
-function buildWaterLevelChart(name, label, days, stJulyAvg, isFirst, stationId) {
+// ── Level / flow / spread charts (Chart.js PNG, same pipeline as the temp charts) ──
+//
+// These were hand-built <table> bar charts positioned with negative CSS margins.
+// That approach had no y-axis at all, and the reference lines were placed with
+// `margin-top:-Npx; margin-bottom:(N-1)px`, so each line displaced the ones
+// after it and inflated the container by its own offset. Rendering to PNG gets
+// real axes, correct gridlines, and no layout arithmetic.
+
+const CHART_PNG_W = 560;
+const CHART_PNG_H = 175;
+
+const canvasCache = new Map();
+function getCanvas(width, height) {
+  const key = `${width}x${height}`;
+  if (!canvasCache.has(key)) {
+    canvasCache.set(key, new ChartJSNodeCanvas({ width, height, backgroundColour: '#FFFFFF' }));
+  }
+  return canvasCache.get(key);
+}
+
+const AXIS_FONT = { size: 10, family: 'sans-serif' };
+const GRID = '#F0EDE8';
+const INK = '#0B1D33';
+const MUTED = '#6B6B6B';
+
+// Shared scale/plugin block. `yFmt` formats tick values; `title`/`subtitle`
+// render inside the PNG so the caption travels with the image.
+function chartFrame(title, subtitle, yLabel, yFmt, xLabels) {
+  return {
+    responsive: false,
+    animation: false,
+    scales: {
+      x: {
+        ticks: {
+          callback(i) { return xLabels[i] ?? ''; },
+          font: AXIS_FONT, color: MUTED,
+          maxRotation: 0, autoSkip: true, maxTicksLimit: 6,
+        },
+        grid: { display: false },
+      },
+      y: {
+        title: { display: !!yLabel, text: yLabel, font: { size: 10, family: 'sans-serif' }, color: MUTED },
+        ticks: { callback: yFmt, font: AXIS_FONT, color: MUTED, maxTicksLimit: 5 },
+        grid: { color: GRID },
+      },
+    },
+    plugins: {
+      title: {
+        display: true, text: title,
+        font: { size: 12, weight: '600', family: 'sans-serif' },
+        color: INK, padding: { bottom: 2 },
+      },
+      subtitle: {
+        display: !!subtitle, text: subtitle,
+        font: { size: 10, family: 'sans-serif' },
+        color: MUTED, padding: { bottom: 6 },
+      },
+      legend: { display: false },
+      tooltip: { enabled: false },
+    },
+    // Right padding keeps the "latest" marker off the frame edge.
+    layout: { padding: { left: 4, right: 18, top: 2, bottom: 2 } },
+  };
+}
+
+// Pad a data range so the series never sits flat against the frame. A dead-flat
+// series (range 0) still needs a window or Chart.js picks an arbitrary one.
+function paddedBounds(values, extra = [], padFrac = 0.18, floor = 0.02) {
+  const all = [...values, ...extra.filter(v => v !== null && v !== undefined && isFinite(v))];
+  let lo = Math.min(...all);
+  let hi = Math.max(...all);
+  const pad = Math.max((hi - lo) * padFrac, floor);
+  return { min: lo - pad, max: hi + pad };
+}
+
+// One chart section: PNG plus the <img> that references it by CID.
+function chartSection(cid, buffer, isFirst, altText) {
+  const style = isFirst
+    ? 'margin-top:12px;'
+    : 'margin-top:18px;border-top:1px solid #E0DAD2;padding-top:14px;';
+  return {
+    buffer,
+    cid,
+    html: `
+      <div style="${style}">
+        <img src="cid:${cid}" alt="${altText}" style="width:100%;max-width:${CHART_PNG_W}px;height:auto;border-radius:8px;border:1px solid #E0DAD2;display:block;" />
+      </div>`,
+  };
+}
+
+async function buildWaterLevelChart(name, label, days, stJulyAvg, isFirst, stationId) {
   if (!days || days.length === 0) return null;
   const chartDays = lastCalendarDays(days, CHART_DAYS);
   if (chartDays.length === 0) return null;
-  const hwm = stationId ? HIGH_WATER_MARKS[stationId] : null;
-  const barPx = Math.min(16, Math.max(3, Math.floor(440 / chartDays.length)));
 
   const latest = chartDays[chartDays.length - 1];
+  const values = chartDays.map(d => d.value);
+  const xLabels = chartDays.map(fmtShort);
+
   const vsJulyStr = stJulyAvg !== null
-    ? (() => {
-        const diffIn = (latest.value - stJulyAvg) * 100 / CM_PER_INCH;
-        return ` · ${diffIn >= 0 ? '+' : ''}${diffIn.toFixed(1)}in vs Jul avg`;
-      })()
+    ? `${((latest.value - stJulyAvg) * 100 / CM_PER_INCH) >= 0 ? '+' : ''}${((latest.value - stJulyAvg) * 100 / CM_PER_INCH).toFixed(1)} in vs July avg`
+    : 'July average unavailable';
+
+  // Scale to the observed water only. The old chart folded the record high into
+  // these bounds, which stretched the axis ~4x and flattened the actual season
+  // into a sliver at the bottom.
+  const { min, max } = paddedBounds(values, [stJulyAvg]);
+
+  const datasets = [{
+    data: values,
+    borderColor: '#2D6A9F',
+    backgroundColor: 'rgba(74, 155, 217, 0.18)',
+    borderWidth: 2,
+    fill: 'start',
+    tension: 0.25,
+    pointRadius: chartDays.map((_, i) => (i === chartDays.length - 1 ? 4 : 0)),
+    pointBackgroundColor: '#E07B4C',
+    pointBorderColor: '#FFFFFF',
+    pointBorderWidth: 1.5,
+    order: 0,
+  }];
+
+  if (stJulyAvg !== null) {
+    datasets.push({
+      data: values.map(() => stJulyAvg),
+      borderColor: '#5BA88A',
+      borderWidth: 1.5,
+      borderDash: [5, 4],
+      pointRadius: 0,
+      fill: false,
+      order: 1,
+    });
+  }
+
+  const decimals = (max - min) < 0.5 ? 3 : 2;
+  const opts = chartFrame(
+    `${name} — ${label}`,
+    `Water level, trailing ${CHART_DAYS} days · ${vsJulyStr}`,
+    'metres',
+    (v) => Number(v).toFixed(decimals),
+    xLabels
+  );
+  // suggested* rather than hard bounds so Chart.js still picks round tick values
+  opts.scales.y.suggestedMin = min;
+  opts.scales.y.suggestedMax = max;
+
+  const buffer = await getCanvas(CHART_PNG_W, CHART_PNG_H).renderToBuffer({
+    type: 'line',
+    data: { labels: xLabels.map((_, i) => i), datasets },
+    options: opts,
+  });
+
+  const section = chartSection(`level-${stationId}`, buffer, isFirst, `${name} water level, trailing ${CHART_DAYS} days`);
+  const legend = stJulyAvg !== null
+    ? `<div style="margin-top:4px;font-size:9px;color:#999;">
+          <span style="display:inline-block;width:16px;border-top:2px solid #2D6A9F;vertical-align:middle;margin-right:4px;"></span>Daily level
+          <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#E07B4C;vertical-align:middle;margin-left:10px;margin-right:4px;"></span>Latest (${fmtShort(latest)})
+          <span style="display:inline-block;width:16px;border-top:1.5px dashed #5BA88A;vertical-align:middle;margin-left:10px;margin-right:4px;"></span>July avg
+        </div>`
     : '';
-
-  const minVal = Math.min(...chartDays.map(d => d.value), stJulyAvg ?? Infinity, hwm ? hwm.level : Infinity);
-  const maxVal = Math.max(...chartDays.map(d => d.value), stJulyAvg ?? -Infinity, hwm ? hwm.level : -Infinity);
-  const range = maxVal - minVal || CHART_MIN_RANGE;
-
-  const firstDate = chartDays[0];
-  const midDate = chartDays[Math.floor(chartDays.length / 2)];
-  const lastDate = chartDays[chartDays.length - 1];
-
-  const bars = chartDays.map((d, i) => {
-    const pct = (d.value - minVal) / range;
-    const height = Math.max(CHART_MIN_BAR_PX, Math.round(pct * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
-    const color = i === chartDays.length - 1 ? '#E07B4C' : '#4A9BD9';
-    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:${barPx}px;height:${height}px;background:${color};border-radius:1px;"></div></td>`;
-  }).join('');
-
-  let refLines = '';
-  if (stJulyAvg !== null) {
-    const refPx = Math.max(1, Math.round(((stJulyAvg - minVal) / range) * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
-    refLines += `<div style="margin-top:-${refPx}px;border-top:1px dashed #5BA88A;height:0;margin-bottom:${refPx - 1}px;"></div>`;
-  }
-  if (hwm) {
-    const refPx = Math.max(1, Math.round(((hwm.level - minVal) / range) * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
-    refLines += `<div style="margin-top:-${refPx}px;border-top:1px dashed #C0392B;height:0;margin-bottom:${refPx - 1}px;"></div>`;
-  }
-
-  const sectionStyle = isFirst
-    ? 'margin-top:12px;'
-    : 'margin-top:20px;border-top:1px solid #E0DAD2;padding-top:16px;';
-
-  const legendItems = [
-    '<span style="display:inline-block;width:8px;height:8px;background:#4A9BD9;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Daily level',
-    '<span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Today',
-  ];
-  if (stJulyAvg !== null) {
-    legendItems.push('<span style="display:inline-block;width:12px;border-top:1px dashed #5BA88A;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Jul avg');
-  }
-  if (hwm) {
-    legendItems.push(`<span style="display:inline-block;width:12px;border-top:1px dashed #C0392B;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>${hwm.year} high`);
-  }
-
-  const html = `
-      <div style="${sectionStyle}">
-        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:2px;">${name} — ${label}</div>
-        <div style="font-size:9px;color:#999;margin-bottom:8px;">Water Level — Trailing ${CHART_DAYS} Days${vsJulyStr}</div>
-        <div style="display:inline-block;">
-          <div style="border-bottom:1px solid #E0DAD2;padding-left:2px;">
-            <table style="border-collapse:collapse;height:${CHART_HEIGHT_PX}px;"><tr>${bars}</tr></table>
-            ${refLines}
-          </div>
-          <table style="width:100%;border-collapse:collapse;margin-top:2px;"><tr>
-            <td style="font-size:9px;color:#999;text-align:left;padding:0;">${fmtShort(firstDate)}</td>
-            <td style="font-size:9px;color:#999;text-align:center;padding:0;">${fmtShort(midDate)}</td>
-            <td style="font-size:9px;color:#6B6B6B;text-align:right;font-weight:600;padding:0;">${fmtShort(lastDate)}</td>
-          </tr></table>
-        </div>
-        <div style="margin-top:6px;font-size:9px;color:#999;">${legendItems.join('\n          ')}</div>
-      </div>`;
-
-  return { html };
+  section.html = section.html.replace('</div>', `${legend}\n      </div>`);
+  return section;
 }
 
-function buildSpreadChart(balaDays, balaJulyAvg, beauDays, beauJulyAvg) {
+async function buildSpreadChart(balaDays, balaJulyAvg, beauDays, beauJulyAvg) {
   if (!balaDays || !beauDays || balaJulyAvg === null || beauJulyAvg === null) return null;
 
   const balaByDate = new Map(balaDays.map(d => [d.date, d.value]));
@@ -1045,96 +1124,95 @@ function buildSpreadChart(balaDays, balaJulyAvg, beauDays, beauJulyAvg) {
   const chartDays = lastCalendarDays(spreadDays, CHART_DAYS);
   if (chartDays.length === 0) return null;
   const latestSpread = chartDays[chartDays.length - 1].spread;
-  const barPx = Math.min(16, Math.max(3, Math.floor(440 / chartDays.length)));
-
   const values = chartDays.map(d => d.spread);
-  const minVal = Math.min(...values, 0) - 0.5;
-  const maxVal = Math.max(...values, 0) + 0.5;
-  const range = maxVal - minVal || CHART_MIN_RANGE;
+  const xLabels = chartDays.map(fmtShort);
+  const { min, max } = paddedBounds(values, [0], 0.18, 0.25);
 
-  const firstDate = chartDays[0];
-  const midDate = chartDays[Math.floor(chartDays.length / 2)];
-  const lastDate = chartDays[chartDays.length - 1];
+  const opts = chartFrame(
+    'Beaumaris vs Bala — Water Level Spread',
+    `Trailing ${CHART_DAYS} days · now ${latestSpread >= 0 ? '+' : ''}${latestSpread.toFixed(1)} in · normalized to each station's July average`,
+    'inches',
+    (v) => (v > 0 ? '+' : '') + Number(v).toFixed(1),
+    xLabels
+  );
+  opts.scales.y.suggestedMin = min;
+  opts.scales.y.suggestedMax = max;
+  opts.scales.y.grid = { color: (ctx) => (ctx.tick.value === 0 ? '#999' : GRID) };
 
-  const bars = chartDays.map((d) => {
-    const pct = (d.spread - minVal) / range;
-    const height = Math.max(CHART_MIN_BAR_PX, Math.round(pct * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
-    const color = d.spread >= 0 ? '#4A9BD9' : '#E07B4C';
-    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:${barPx}px;height:${height}px;background:${color};border-radius:1px;"></div></td>`;
-  }).join('');
+  const buffer = await getCanvas(CHART_PNG_W, CHART_PNG_H).renderToBuffer({
+    type: 'bar',
+    data: {
+      labels: xLabels.map((_, i) => i),
+      datasets: [{
+        data: values,
+        backgroundColor: values.map(v => (v >= 0 ? '#4A9BD9' : '#E07B4C')),
+        barPercentage: 1.0,
+        categoryPercentage: 1.0,
+      }],
+    },
+    options: opts,
+  });
 
-  const zeroPx = Math.max(1, Math.round(((0 - minVal) / range) * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
-  const zeroLine = `<div style="margin-top:-${zeroPx}px;border-top:1px solid #666;height:0;margin-bottom:${zeroPx - 1}px;"></div>`;
-
-  const html = `
-      <div style="margin-top:20px;border-top:1px solid #E0DAD2;padding-top:16px;">
-        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:2px;">Beaumaris vs Bala — Water Level Spread</div>
-        <div style="font-size:9px;color:#999;margin-bottom:8px;">Trailing ${CHART_DAYS} Days · Current: ${latestSpread >= 0 ? '+' : ''}${latestSpread.toFixed(1)}in</div>
-        <div style="display:inline-block;">
-          <div style="border-bottom:1px solid #E0DAD2;padding-left:2px;">
-            <table style="border-collapse:collapse;height:${CHART_HEIGHT_PX}px;"><tr>${bars}</tr></table>
-            ${zeroLine}
-          </div>
-          <table style="width:100%;border-collapse:collapse;margin-top:2px;"><tr>
-            <td style="font-size:9px;color:#999;text-align:left;padding:0;">${fmtShort(firstDate)}</td>
-            <td style="font-size:9px;color:#999;text-align:center;padding:0;">${fmtShort(midDate)}</td>
-            <td style="font-size:9px;color:#6B6B6B;text-align:right;font-weight:600;padding:0;">${fmtShort(lastDate)}</td>
-          </tr></table>
-        </div>
+  const section = chartSection('spread', buffer, false, 'Beaumaris vs Bala water level spread');
+  section.html = section.html.replace('</div>', `
         <div style="margin-top:4px;font-size:9px;color:#999;">
           <span style="display:inline-block;width:8px;height:8px;background:#4A9BD9;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Beaumaris above Bala
-          <span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Bala above Beaumaris
+          <span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:10px;margin-right:3px;"></span>Bala above Beaumaris
         </div>
-        <div style="font-size:8px;color:#BBB;margin-top:2px;">Normalized to each station’s 5-year July average (inches)</div>
-      </div>`;
-
-  return { html };
+      </div>`);
+  return section;
 }
 
-function buildFlowChart(name, label, days, isFirst) {
-  if (!days || days.length === 0) return '';
+async function buildFlowChart(name, label, days, isFirst, stationId) {
+  if (!days || days.length === 0) return null;
   const chartDays = lastCalendarDays(days, CHART_DAYS);
-  if (chartDays.length === 0) return '';
-  const barPx = Math.min(16, Math.max(3, Math.floor(440 / chartDays.length)));
-  const minVal = Math.min(...chartDays.map(d => d.value));
-  const maxVal = Math.max(...chartDays.map(d => d.value));
-  const range = maxVal - minVal || CHART_MIN_RANGE;
+  if (chartDays.length === 0) return null;
 
-  const bars = chartDays.map((d, i) => {
-    const pct = (d.value - minVal) / range;
-    const height = Math.max(CHART_MIN_BAR_PX, Math.round(pct * (CHART_HEIGHT_PX - 10) + CHART_MIN_BAR_PX));
-    const color = i === chartDays.length - 1 ? '#E07B4C' : '#6B8EAD';
-    return `<td style="vertical-align:bottom;padding:0 0.5px;"><div style="width:${barPx}px;height:${height}px;background:${color};border-radius:1px;" title="${d.date}: ${d.value.toFixed(1)} m³/s"></div></td>`;
-  }).join('');
-
-  const firstDate = chartDays[0];
-  const midDate = chartDays[Math.floor(chartDays.length / 2)];
-  const lastDate = chartDays[chartDays.length - 1];
   const latest = chartDays[chartDays.length - 1];
+  const values = chartDays.map(d => d.value);
+  const xLabels = chartDays.map(fmtShort);
+  // Flow is a magnitude, so anchor the axis at zero unless that would flatten
+  // the series into a thin band at the top.
+  const peak = Math.max(...values);
+  const trough = Math.min(...values);
+  const zeroAnchored = trough <= peak * 0.55;
+  const { min, max } = zeroAnchored
+    ? { min: 0, max: peak * 1.12 }
+    : paddedBounds(values, [], 0.18, 0.1);
 
-  const sectionStyle = isFirst
-    ? 'margin-top:12px;'
-    : 'margin-top:20px;border-top:1px solid #E0DAD2;padding-top:16px;';
+  const flowDecimals = max >= 10 ? 0 : 1;
+  const opts = chartFrame(
+    `${name} — ${label}`,
+    `River flow, trailing ${CHART_DAYS} days · ${latest.value.toFixed(1)} m³/s on ${fmtShort(latest)}`,
+    'm³/s',
+    (v) => Number(v).toFixed(flowDecimals),
+    xLabels
+  );
+  if (zeroAnchored) opts.scales.y.min = 0; // keep the fill anchored to a true zero
+  else opts.scales.y.suggestedMin = min;
+  opts.scales.y.suggestedMax = max;
 
-  return `
-      <div style="${sectionStyle}">
-        <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:2px;">${name} — ${label}</div>
-        <div style="font-size:9px;color:#999;margin-bottom:8px;">Flow Rate — Trailing ${CHART_DAYS} Days · ${latest.value.toFixed(1)} m³/s</div>
-        <div style="display:inline-block;">
-          <div style="position:relative;border-bottom:1px solid #E0DAD2;padding-left:2px;">
-            <table style="border-collapse:collapse;height:${CHART_HEIGHT_PX}px;"><tr>${bars}</tr></table>
-          </div>
-          <table style="width:100%;border-collapse:collapse;margin-top:2px;"><tr>
-            <td style="font-size:9px;color:#999;text-align:left;padding:0;">${fmtShort(firstDate)}</td>
-            <td style="font-size:9px;color:#999;text-align:center;padding:0;">${fmtShort(midDate)}</td>
-            <td style="font-size:9px;color:#6B6B6B;text-align:right;font-weight:600;padding:0;">${fmtShort(lastDate)}</td>
-          </tr></table>
-        </div>
-        <div style="margin-top:6px;font-size:9px;color:#999;">
-          <span style="display:inline-block;width:8px;height:8px;background:#6B8EAD;border-radius:1px;vertical-align:middle;margin-right:3px;"></span>Daily flow
-          <span style="display:inline-block;width:8px;height:8px;background:#E07B4C;border-radius:1px;vertical-align:middle;margin-left:8px;margin-right:3px;"></span>Today
-        </div>
-      </div>`;
+  const buffer = await getCanvas(CHART_PNG_W, CHART_PNG_H).renderToBuffer({
+    type: 'line',
+    data: {
+      labels: xLabels.map((_, i) => i),
+      datasets: [{
+        data: values,
+        borderColor: '#4C7A99',
+        backgroundColor: 'rgba(107, 142, 173, 0.22)',
+        borderWidth: 2,
+        fill: 'start',
+        tension: 0.25,
+        pointRadius: chartDays.map((_, i) => (i === chartDays.length - 1 ? 4 : 0)),
+        pointBackgroundColor: '#E07B4C',
+        pointBorderColor: '#FFFFFF',
+        pointBorderWidth: 1.5,
+      }],
+    },
+    options: opts,
+  });
+
+  return chartSection(`flow-${stationId}`, buffer, isFirst, `${name} river flow, trailing ${CHART_DAYS} days`);
 }
 
 function txtRow(name, label, recentDays, stJulyAvg, lowWater) {
@@ -1484,10 +1562,21 @@ async function main() {
   const waterLevelCharts = [];
   for (const input of waterLevelChartInputs) {
     try {
-      const result = buildWaterLevelChart(input.name, input.label, input.days, input.julyAvg, input.isFirst, input.stationId);
+      const result = await buildWaterLevelChart(input.name, input.label, input.days, input.julyAvg, input.isFirst, input.stationId);
       if (result) waterLevelCharts.push(result);
     } catch (e) {
       console.log(`  Chart for ${input.name} failed: ${e.message}`);
+    }
+  }
+
+  // Flow charts (PNG) — built here so their buffers can be attached alongside
+  const flowCharts = [];
+  for (const [i, s] of freshFlowResults.entries()) {
+    try {
+      const result = await buildFlowChart(s.name, s.label, s.recentDays, i === 0, s.id);
+      if (result) flowCharts.push(result);
+    } catch (e) {
+      console.log(`  Flow chart for ${s.name} failed: ${e.message}`);
     }
   }
 
@@ -1496,7 +1585,7 @@ async function main() {
   try {
     const beaumaris = extraResults.find(s => s.id === '02EB018');
     if (beaumaris && beaumaris.recentDays) {
-      spreadChart = buildSpreadChart(recentData, julyAvg, beaumaris.recentDays, beaumaris.julyAvg);
+      spreadChart = await buildSpreadChart(recentData, julyAvg, beaumaris.recentDays, beaumaris.julyAvg);
     }
   } catch (e) {
     console.log(`  Spread chart failed: ${e.message}`);
@@ -1521,13 +1610,9 @@ async function main() {
       const belowSummer = stJulyAvg !== null ? ((level - stJulyAvg) * 100 / CM_PER_INCH) : null;
       const belowSummerStr = belowSummer !== null ? (belowSummer >= 0 ? '+' : '') + belowSummer.toFixed(1) : '\u2014';
 
-      const hwm = HIGH_WATER_MARKS[stationId];
-      const vsHigh = hwm ? ((level - hwm.level) * 100 / CM_PER_INCH) : null;
-      const vsHighStr = vsHigh !== null ? (vsHigh >= 0 ? '+' : '') + vsHigh.toFixed(1) : '\u2014';
-
       function dayChange(n) {
-        if (days.length <= n) return '\u2014';
-        const prev = days[days.length - 1 - n];
+        const prev = readingNDaysBack(days, n, 1);
+        if (!prev) return '\u2014';
         const chg = (level - prev.value) * 100 / CM_PER_INCH;
         return (chg >= 0 ? '+' : '') + chg.toFixed(1);
       }
@@ -1538,7 +1623,6 @@ async function main() {
         + '<td style="' + td + 'font-size:9px;color:#6B6B6B;">' + label + '</td>'
         + '<td style="' + tdr + '">' + level.toFixed(3) + '</td>'
         + '<td style="' + tdr + '">' + belowSummerStr + '</td>'
-        + '<td style="' + tdr + '">' + vsHighStr + '</td>'
         + '<td style="' + tdr + '">' + dayChange(1) + '</td>'
         + '<td style="' + tdr + '">' + dayChange(2) + '</td>'
         + '<td style="' + tdr + '">' + dayChange(3) + '</td>'
@@ -1558,7 +1642,6 @@ async function main() {
       + '<th style="' + th + '">Water</th>'
       + '<th style="' + thr + '">Lvl (m)</th>'
       + '<th style="' + thr + '">vs Sum</th>'
-      + '<th style="' + thr + '">vs Hi</th>'
       + '<th style="' + thr + '">1d</th>'
       + '<th style="' + thr + '">2d</th>'
       + '<th style="' + thr + '">3d</th>'
@@ -1646,12 +1729,10 @@ async function main() {
       ${spreadChart ? spreadChart.html : ''}
 
       <!-- Flow Rate Charts -->
-      ${freshFlowResults.length > 0 ? `
+      ${flowCharts.length > 0 ? `
       <div style="margin-top:24px;border-top:2px solid #E0DAD2;padding-top:16px;">
         <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:#6B6B6B;margin-bottom:4px;">River Flow Rates</div>
-        ${freshFlowResults
-          .map((s, i) => buildFlowChart(s.name, s.label, s.recentDays, i === 0))
-          .join('')}
+        ${flowCharts.map(c => c.html).join('')}
       </div>
       ` : ''}
     </div>
@@ -1709,12 +1790,21 @@ async function main() {
       content_id: 'temp-anomaly-chart',
     });
   }
+  for (const c of [...waterLevelCharts, ...(spreadChart ? [spreadChart] : []), ...flowCharts]) {
+    attachments.push({
+      filename: `${c.cid}.png`,
+      content: c.buffer.toString('base64'),
+      content_id: c.cid,
+    });
+  }
+  console.log(`  ${attachments.length} chart attachments, ${Math.round(attachments.reduce((n, a) => n + a.content.length, 0) / 1024)}KB base64 total`);
 
   if (dryRun) {
-    // Inline the CID attachments as data: URIs so the preview renders standalone
-    const previewHtml = html
-      .replace('cid:temp-chart', tempChartBuffer ? `data:image/png;base64,${tempChartBuffer.toString('base64')}` : '')
-      .replace('cid:temp-anomaly-chart', tempAnomalyChartBuffer ? `data:image/png;base64,${tempAnomalyChartBuffer.toString('base64')}` : '');
+    // Inline every CID attachment as a data: URI so the preview renders standalone
+    let previewHtml = html;
+    for (const a of attachments) {
+      previewHtml = previewHtml.replaceAll(`cid:${a.content_id}`, `data:image/png;base64,${a.content}`);
+    }
     await fs.writeFile(__dirname + 'preview.html', previewHtml, 'utf8');
     await fs.writeFile(__dirname + 'preview.txt', text, 'utf8');
     console.log('📄 Dry run — no email sent.');
@@ -1749,7 +1839,16 @@ async function main() {
   console.log(`   To: ${EMAIL_TO.join(', ')}`);
 }
 
-main().catch(err => {
-  console.error('❌ Error:', err.message);
-  process.exit(1);
-});
+// Only run when invoked directly, so the chart builders can be imported and
+// exercised on their own (see scripts/preview-charts.mjs).
+const invokedDirectly = process.argv[1]
+  && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+
+if (invokedDirectly) {
+  main().catch(err => {
+    console.error('❌ Error:', err.message);
+    process.exit(1);
+  });
+}
+
+export { buildWaterLevelChart, buildFlowChart, buildSpreadChart };
