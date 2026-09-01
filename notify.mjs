@@ -15,16 +15,19 @@ const TEMP_CSV_PATH = __dirname + 'data/water-temp.csv';
  * email via Resend.
  *
  * Data sources:
- *   MSC GeoMet OGC API (api.weather.gc.ca) — water levels
- *   NOAA ERDDAP MUR SST (polarwatch.noaa.gov) — water temperature
+ *   MSC GeoMet OGC API (api.weather.gc.ca) — water levels and river flow
+ *   NOAA MUR SST via ERDDAP mirrors, NCEI THREDDS fallback — water temperature
  * Station: 02EB015 — Bala Bay at Bala (Lake Muskoka)
  */
 
 const STATION = '02EB015';
 const API_BASE = 'https://api.weather.gc.ca/collections';
 
-// Time windows derived at run time.
-const TODAY_ISO = new Date().toISOString().substring(0, 10);
+// Time windows derived at run time. "Today" is the calendar date at the lake,
+// not UTC — a manual run after 8pm Eastern is otherwise dated tomorrow, which
+// shifts every trailing window and inflates the staleness math by a day.
+// (en-CA formats as YYYY-MM-DD.)
+const TODAY_ISO = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Toronto' });
 const CURRENT_YEAR = parseInt(TODAY_ISO.substring(0, 4));
 // Annual low-water search: from Jan 1 of the current year through today.
 const LOW_WATER_START = `${CURRENT_YEAR}-01-01`;
@@ -100,17 +103,30 @@ async function fetchJSON(url) {
   return resp.json();
 }
 
+// Two stations appear in both the level and flow lists, and the realtime
+// response carries LEVEL and DISCHARGE together — so the level and flow paths
+// request the exact same URLs. Dedupe by first-page URL; a failed fetch is
+// evicted so the second caller still gets its own retry.
+const featureCache = new Map();
+
 async function fetchAllFeatures(buildUrl, maxPages = 20) {
   const size = 500;
-  let all = [];
-  for (let p = 0; p < maxPages; p++) {
-    const url = buildUrl(size, p * size);
-    const data = await fetchJSON(url);
-    const feats = data.features || [];
-    all = all.concat(feats);
-    if (feats.length < size) break;
+  const key = buildUrl(size, 0);
+  if (!featureCache.has(key)) {
+    const p = (async () => {
+      let all = [];
+      for (let page = 0; page < maxPages; page++) {
+        const data = await fetchJSON(buildUrl(size, page * size));
+        const feats = data.features || [];
+        all = all.concat(feats);
+        if (feats.length < size) break;
+      }
+      return all;
+    })();
+    featureCache.set(key, p);
+    p.catch(() => featureCache.delete(key));
   }
-  return all;
+  return featureCache.get(key);
 }
 
 // ── Parsers ──
@@ -143,18 +159,29 @@ function parseDaily(features, field) {
 
 // ── Outlier filter ──
 
+// Judge each reading against the median of its 4 nearest neighbours. An
+// earlier version compared against the mean of the two adjacent points, which
+// had two failure modes: a single spike poisoned the average and took out its
+// innocent neighbour with it, and the endpoints were exempt entirely — even
+// though the newest reading becomes the headline number, the subject line, and
+// a cache entry. The median of 4 shrugs off one bad value, and a genuine flood
+// can't trip the threshold (2019 peaked near 0.1m/day against a 0.5m limit).
 function filterOutliers(data) {
   if (data.length < 4) return data;
-  const clean = [data[0]];
-  for (let i = 1; i < data.length - 1; i++) {
-    const avg = (data[i - 1].value + data[i + 1].value) / 2;
-    if (Math.abs(data[i].value - avg) > OUTLIER_THRESHOLD_M) {
-      console.log(`  Outlier removed: ${data[i].date} = ${data[i].value}m`);
+  const clean = [];
+  for (let i = 0; i < data.length; i++) {
+    const idx = [];
+    for (let r = 1; idx.length < 4 && (i - r >= 0 || i + r < data.length); r++) {
+      if (i - r >= 0) idx.push(i - r);
+      if (i + r < data.length && idx.length < 4) idx.push(i + r);
+    }
+    const med = median(idx.map(j => data[j].value));
+    if (Math.abs(data[i].value - med) > OUTLIER_THRESHOLD_M) {
+      console.log(`  Outlier removed: ${data[i].date} = ${data[i].value}m (neighbour median ${med.toFixed(3)}m)`);
       continue;
     }
     clean.push(data[i]);
   }
-  clean.push(data[data.length - 1]);
   return clean;
 }
 
@@ -292,7 +319,9 @@ async function loadCachedTemp() {
 
 async function saveTempCache(records) {
   await fs.mkdir(__dirname + 'data', { recursive: true });
-  const rows = records.map(r => `${r.date},${r.tempC}`);
+  // 3 decimals: the source data is packed shorts at 0.001°C, so anything past
+  // that is float noise ("7.1129999999999995") bloating the CSV
+  const rows = records.map(r => `${r.date},${Math.round(r.tempC * 1000) / 1000}`);
   await fs.writeFile(TEMP_CSV_PATH, 'date,tempC\n' + rows.join('\n') + '\n', 'utf8');
 }
 
@@ -603,15 +632,6 @@ async function buildTempSpaghettiChart(records, waterTemp) {
   const monthStarts = [1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335];
   const monthLabels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-  const chartWidth = 560;
-  const chartHeight = 280;
-
-  const chartJSNodeCanvas = new ChartJSNodeCanvas({
-    width: chartWidth,
-    height: chartHeight,
-    backgroundColour: '#FFFFFF',
-  });
-
   const config = {
     type: 'scatter',
     data: { datasets },
@@ -672,7 +692,7 @@ async function buildTempSpaghettiChart(records, waterTemp) {
     },
   };
 
-  const buffer = await chartJSNodeCanvas.renderToBuffer(config);
+  const buffer = await getCanvas(560, 280).renderToBuffer(config);
   console.log(`  Spaghetti chart: ${buffer.length} bytes PNG`);
   return buffer;
 }
@@ -823,15 +843,6 @@ async function buildTempAnomalyChart(records) {
     data.push({ x: day, y: (actual !== undefined && baseline !== null) ? actual - baseline : null });
   }
 
-  const chartWidth = 560;
-  const chartHeight = 280;
-
-  const chartJSNodeCanvas = new ChartJSNodeCanvas({
-    width: chartWidth,
-    height: chartHeight,
-    backgroundColour: '#FFFFFF',
-  });
-
   const allMonthStarts = [1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335];
   const allMonthLabels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   const monthLabelByStart = new Map(allMonthStarts.map((v, i) => [v, allMonthLabels[i]]));
@@ -899,7 +910,7 @@ async function buildTempAnomalyChart(records) {
     },
   };
 
-  const buffer = await chartJSNodeCanvas.renderToBuffer(config);
+  const buffer = await getCanvas(560, 280).renderToBuffer(config);
   console.log(`  Anomaly chart: ${buffer.length} bytes PNG`);
   return buffer;
 }
@@ -1309,7 +1320,7 @@ async function fetchFlowData(stationId) {
   // so we catch data even if the discharge rating curve lags months behind.
   try {
     const feats = await fetchAllFeatures(
-      (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${stationId}&datetime=${HISTORY_START}/${TODAY_ISO}&limit=${lim}&offset=${off}`,
+      (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${stationId}&datetime=${HISTORY_START}/${HISTORY_END}&limit=${lim}&offset=${off}`,
       20
     );
     const withDischarge = feats.filter(f => f.properties?.DISCHARGE != null).length;
@@ -1404,10 +1415,24 @@ async function main() {
 
   // 4. Fetch water temperature: current + historical for spaghetti chart
   console.log('Fetching water temperature (current + historical)...');
-  const [waterTemp, historicalTempRecords] = await Promise.all([
+  let [waterTemp, historicalTempRecords] = await Promise.all([
     fetchWaterTemp(),
     fetchHistoricalWaterTemp(),
   ]);
+
+  // The live sources share infrastructure that periodically blacklists GitHub
+  // runner IPs, but the on-disk history usually holds a reading only a few
+  // days old. Without this fallback an outage silently drops the temperature
+  // headline, the ranking line, the 7-day forecast, and the chart's today
+  // marker — everything downstream labels the reading by its date, so a
+  // slightly older one degrades gracefully.
+  if (!waterTemp && historicalTempRecords && historicalTempRecords.length > 0) {
+    const newest = historicalTempRecords[historicalTempRecords.length - 1];
+    if (newest.date >= addDays(TODAY_ISO, -10)) {
+      waterTemp = { tempC: Math.round(newest.tempC * 10) / 10, date: newest.date };
+      console.log(`  Live temp sources failed — using cached reading ${newest.date} = ${waterTemp.tempC}°C`);
+    }
+  }
   const tempF = waterTemp ? Math.round(waterTemp.tempC * 9 / 5 + 32) : null;
   const tempYears = historicalTempRecords ? [...new Set(historicalTempRecords.map(r => r.year))] : [];
   const tempGreyYears = tempYears.filter(y => y <= CURRENT_YEAR - 2);
@@ -1851,4 +1876,10 @@ if (invokedDirectly) {
   });
 }
 
-export { buildWaterLevelChart, buildFlowChart, buildSpreadChart };
+export {
+  buildWaterLevelChart, buildFlowChart, buildSpreadChart,
+  // pure helpers, exported for scripts/test.mjs
+  filterOutliers, readingNDaysBack, median, poolAroundDay, addDays, toRecord,
+  lastCalendarDays, mergeWithLevelCache, parseMurAscii,
+  computeTodayTempStats, computeNextWeekTempForecast,
+};

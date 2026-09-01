@@ -36,6 +36,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Run tests
+        run: npm test
+
       - name: Send water level notification
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
