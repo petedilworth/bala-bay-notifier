@@ -46,8 +46,16 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
         run: node notify.mjs
 
-      - name: Save updated data
-        if: success()
+      # Reads data/ only — no network. Runs even when the send above failed, so
+      # a Resend outage can't freeze the dashboard: notify.mjs refreshes the
+      # caches before it sends, and those refreshed caches are what the site is
+      # built from.
+      - name: Build dashboard site
+        if: always()
+        run: npm run build:site
+
+      - name: Save updated data and site
+        if: always()
         run: |
           if [ ! -d data ]; then
             echo "No data directory — skipping commit"
@@ -55,7 +63,7 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/
+          git add data/ docs/
           git diff --staged --quiet && echo "No changes to commit" && exit 0
-          git commit -m "Update cached water data"
+          git commit -m "Update cached water data and rebuild site"
           git push

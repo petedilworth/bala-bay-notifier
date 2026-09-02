@@ -11,6 +11,9 @@ import {
   filterOutliers, readingNDaysBack, median, poolAroundDay, addDays, toRecord,
   mergeWithLevelCache, parseMurAscii, computeNextWeekTempForecast,
 } from '../notify.mjs';
+import {
+  quantile, distribution, percentileOf, climatology, windowByDate,
+} from './lib/payloads.mjs';
 
 let passed = 0;
 function test(name, fn) {
@@ -140,6 +143,72 @@ test('forecast reflects the historical week-over-week delta', () => {
 
 test('forecast is null with no usable history', () => {
   assert.equal(computeNextWeekTempForecast([], '2026-07-03', 21.0), null);
+});
+
+// ── site payload shaping ──
+
+test('quantile interpolates between neighbours', () => {
+  const s = [1, 2, 3, 4];
+  assert.equal(quantile(s, 0), 1);
+  assert.equal(quantile(s, 1), 4);
+  assert.equal(quantile(s, 0.5), 2.5);
+  assert.equal(quantile([], 0.5), null);
+});
+
+test('distribution reports the five-number summary', () => {
+  const d = distribution([5, 1, 3, 2, 4]);
+  assert.equal(d.min, 1);
+  assert.equal(d.p50, 3);
+  assert.equal(d.max, 5);
+  assert.equal(d.n, 5);
+});
+
+test('percentile places a value in its record', () => {
+  const vals = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+  assert.equal(percentileOf(vals, 0), 0);    // below everything
+  assert.equal(percentileOf(vals, 11), 100); // above everything
+  assert.equal(percentileOf(vals, 5), 45);   // 4 below, itself counted half
+  assert.equal(percentileOf([], 5), null);
+});
+
+test('percentile is not direction-normalised', () => {
+  // A cold reading must report a LOW percentile. Inverting for
+  // "lower is better" would be inventing a judgement the data can't support.
+  const vals = [10, 20, 30, 40];
+  assert.ok(percentileOf(vals, 11) < 50);
+  assert.ok(percentileOf(vals, 39) > 50);
+});
+
+test('climatology excludes the current year and spans every day', () => {
+  const records = [];
+  for (const year of [2023, 2024]) {
+    for (let d = 0; d < 365; d++) records.push(toRecord(addDays(`${year}-01-01`, d), 10));
+  }
+  // A current-year outlier must not move the envelope
+  records.push(toRecord('2026-06-01', 99));
+  const rows = climatology(records, 2026);
+  assert.equal(rows.length, 366);
+  const june1 = rows[toRecord('2026-06-01', 0).dayOfYear - 1];
+  assert.equal(june1[5], 10, 'current-year reading leaked into the envelope');
+});
+
+test('climatology wraps the pooling window across new year', () => {
+  const records = [
+    toRecord('2024-12-31', 4), toRecord('2025-01-02', 6),
+  ];
+  const rows = climatology(records, 2026);
+  assert.equal(rows[0][3], 5, 'day 1 should pool both sides of the boundary');
+});
+
+test('windowByDate trims by calendar date, not row count', () => {
+  // A gap in the middle: naive slice(-3) would reach back a year
+  const rows = [['2025-01-01', 1], ['2025-01-02', 2], ['2026-08-28', 3], ['2026-08-29', 4], ['2026-08-30', 5]];
+  assert.deepEqual(windowByDate(rows, 7).map(r => r[0]),
+    ['2026-08-28', '2026-08-29', '2026-08-30']);
+  assert.deepEqual(rows.slice(-3).map(r => r[0]),
+    ['2026-08-28', '2026-08-29', '2026-08-30']);
+  // and with the gap inside the window it must still exclude the old block
+  assert.equal(windowByDate(rows, 400).length, 3);
 });
 
 console.log(`\n${passed} passed${process.exitCode ? ' — FAILURES ABOVE' : ', 0 failed'}`);

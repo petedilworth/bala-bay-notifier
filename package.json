@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node scripts/test.mjs"
+    "test": "node scripts/test.mjs",
+    "build:site": "node scripts/build-site.mjs"
   },
   "engines": {
     "node": ">=20.9.0"

@@ -349,11 +349,22 @@ async function saveLevelCache() {
 }
 
 // Merge freshly observed daily values into the cache under `key` and return
-// the combined series. Fresh values win; only the last ~400 days are kept.
+// the combined series. Fresh values win; only the newest LEVEL_CACHE_KEEP_DAYS
+// are kept.
+//
+// The cap used to be 400, which quietly discarded most of what had already been
+// paid for: fetchStationData pulls five years of daily means every run, and all
+// but the newest 400 days were thrown away. It also left every station showing
+// a bogus interior gap — an old head block, then a jump of 158-523 days to the
+// recent tail — because the cap trimmed from a series whose middle had never
+// been fetched. Keeping ~5.5 years captures what the API already returns, and
+// the gaps backfill themselves on the next run.
+const LEVEL_CACHE_KEEP_DAYS = 2000;
+
 function mergeWithLevelCache(cache, key, days) {
   const entry = cache[key] || {};
   for (const d of days) entry[d.date] = Math.round(d.value * 10000) / 10000;
-  const keep = Object.keys(entry).sort().slice(-400);
+  const keep = Object.keys(entry).sort().slice(-LEVEL_CACHE_KEEP_DAYS);
   cache[key] = Object.fromEntries(keep.map(k => [k, entry[k]]));
   return keep.map(date => ({ date, value: cache[key][date] }));
 }
@@ -1882,4 +1893,8 @@ export {
   filterOutliers, readingNDaysBack, median, poolAroundDay, addDays, toRecord,
   lastCalendarDays, mergeWithLevelCache, parseMurAscii,
   computeTodayTempStats, computeNextWeekTempForecast,
+  daysBetween, ordinal, paddedBounds,
+  // station tables, so the site generator labels gauges identically to the email
+  STATION, EXTRA_STATIONS, FLOW_STATIONS, CM_PER_INCH, TODAY_ISO, CURRENT_YEAR,
+  TEMP_CSV_PATH, LEVEL_CACHE_PATH,
 };

@@ -1,0 +1,503 @@
+// Static-site generator for the Bala Bay dashboard.
+//
+//   node scripts/build-site.mjs        (or: npm run build:site)
+//
+// Reads only data/ from disk and writes docs/. No network, so the build is
+// deterministic, runs in a sandbox, and cannot be broken by an upstream API
+// outage — the daily notifier is what refreshes data/.
+
+import fs from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import {
+  TODAY_ISO, CURRENT_YEAR, STATION, daysBetween, ordinal,
+} from '../notify.mjs';
+import {
+  loadTemps, loadLevelCache, buildTemperaturePayload, buildAllYearsPayload,
+  buildLevelsPayload, buildFlowPayload, buildOverviewPayload,
+} from './lib/payloads.mjs';
+
+const here = fileURLToPath(new URL('.', import.meta.url));
+const ROOT = here + '../';
+const DOCS = ROOT + 'docs/';
+const PAYLOAD_WARN_KB = 300;
+
+// ── html helpers ──
+
+const esc = (s) => String(s).replace(/[&<>"']/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+const NAV = [
+  ['index.html', 'Today'],
+  ['temperature.html', 'Temperature'],
+  ['levels.html', 'Water levels'],
+  ['flow.html', 'River flow'],
+  ['about.html', 'About'],
+];
+
+function page({ file, title, heading, sub, body, script }) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Public gauge data, but this is a personal dashboard — keep it out of search results. -->
+<meta name="robots" content="noindex, nofollow">
+<title>${esc(title)}</title>
+<!-- Inline so the browser never fires a request for /favicon.ico -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%8C%8A%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<header class="site">
+  <div class="wrap">
+    <div class="brand">
+      <h1>🌊 Bala Bay</h1>
+      <span class="sub">Lake Muskoka water conditions</span>
+    </div>
+    <nav class="site">
+      ${NAV.map(([href, label]) =>
+        `<a href="${href}"${href === file ? ' aria-current="page"' : ''}>${esc(label)}</a>`).join('\n      ')}
+    </nav>
+  </div>
+</header>
+<main class="wrap">
+  <h2 style="margin:0 0 2px;font-size:22px;">${esc(heading)}</h2>
+  <p style="margin:0 0 18px;color:var(--muted);font-size:13px;">${sub}</p>
+${body}
+  <footer class="site">
+    Gauge data: Environment and Climate Change Canada, MSC GeoMet (station 02EB015 and neighbours).
+    Water temperature: NOAA MUR SST v4.1 satellite analysis.<br>
+    Rebuilt automatically each morning. Generated ${TODAY_ISO}.
+  </footer>
+</main>
+<script src="assets/chart.umd.js"></script>
+<script src="assets/app.js"></script>
+<script>
+${script}
+</script>
+</body>
+</html>
+`;
+}
+
+const card = (inner, href) => href
+  ? `<a class="card" href="${href}">${inner}</a>`
+  : `<div class="card">${inner}</div>`;
+
+function kvTable(rows, head) {
+  return `<div class="table-scroll"><table class="kv">
+    <tr>${head.map(h => `<th>${esc(h)}</th>`).join('')}</tr>
+    ${rows.map(r => `<tr>${r.map((c, i) =>
+      `<td${i > 0 ? ' class="n"' : ''}>${c}</td>`).join('')}</tr>`).join('\n    ')}
+  </table></div>`;
+}
+
+function chartCard({ title, sub, id, legend, toggles, short }) {
+  return `<div class="chart-card">
+    <div class="chart-head">
+      <div>
+        <div class="chart-title">${esc(title)}</div>
+        ${sub ? `<div class="chart-sub">${sub}</div>` : ''}
+      </div>
+      ${toggles ? `<div class="toggles" id="${id}-toggles">${toggles.map(([v, l], i) =>
+        `<button type="button" data-value="${v}" aria-pressed="${i === toggles.findIndex(t => t[2]) ? 'true' : 'false'}">${esc(l)}</button>`).join('')}</div>` : ''}
+    </div>
+    <div class="chart-box${short ? ' short' : ''}"><canvas id="${id}"></canvas></div>
+    ${legend ? `<div class="legend">${legend}</div>` : ''}
+  </div>`;
+}
+
+const sw = (color, cls) => `<span class="swatch ${cls || ''}" style="background:${color}"></span>`;
+
+function explain(summary, bodyHtml) {
+  return `<details class="explain"><summary>${esc(summary)}</summary><div class="body">${bodyHtml}</div></details>`;
+}
+
+// Percentile phrasing, stated as a percentile rather than "better than N%" —
+// there is no better or worse here, only where today sits in the record.
+const pctLine = (p, what) =>
+  p === null || p === undefined ? '' : `${ordinal(p)} percentile ${what}`;
+
+function staleNotice(ageDays, what, threshold) {
+  if (ageDays === null || ageDays === undefined || ageDays <= threshold) return '';
+  return `<div class="notice">The most recent ${what} reading is ${ageDays} days old. Everything below describes that reading, not today.</div>`;
+}
+
+// ── pages ──
+
+function indexPage(o, temp) {
+  const lvl = o.level;
+  const t = o.temp;
+
+  const levelCard = lvl ? card(`
+      <h2>Water level · ${esc(lvl.name)}</h2>
+      <div class="big num">${lvl.vsJulyIn === null ? '—' : (lvl.vsJulyIn > 0 ? '+' : '') + lvl.vsJulyIn.toFixed(1)}<span class="unit">in vs July avg</span></div>
+      <div class="asof">${lvl.value.toFixed(3)} m &middot; ${escDate(lvl.date)}</div>
+      <p class="lede">${pctLine(lvl.percentile, `of the last ${lvl.dist.n} days on record`)}</p>
+      ${kvTable([
+        ['Latest', lvl.value.toFixed(3)],
+        ['7-day mean', lvl.trailing.d7 === null ? '—' : lvl.trailing.d7.toFixed(3)],
+        ['30-day mean', lvl.trailing.d30 === null ? '—' : lvl.trailing.d30.toFixed(3)],
+      ], ['', 'metres'])}
+    `, 'levels.html') : '';
+
+  const tempCard = card(`
+      <h2>Water temperature</h2>
+      <div class="big num">${t.value.toFixed(1)}<span class="unit">°C</span><span class="alt">${t.tempF}°F</span></div>
+      <div class="asof">${escDate(t.date)}${t.ageDays > 0 ? ` &middot; satellite lags ${t.ageDays} day${t.ageDays === 1 ? '' : 's'}` : ''}</div>
+      <p class="lede">${t.stats ? `${pctLine(t.stats.percentile, `for this time of year across ${t.years} years`)} &middot; ${ordinal(t.stats.rank)} warmest of ${t.stats.totalYears}` : ''}</p>
+      ${t.stats ? kvTable([
+        ['Today', t.value.toFixed(1)],
+        ['Typical (median)', t.stats.median.toFixed(1)],
+        ['Range on record', `${t.stats.min.toFixed(1)}–${t.stats.max.toFixed(1)}`],
+      ], ['', '°C']) : ''}
+    `, 'temperature.html');
+
+  const flowCard = o.flow.length ? card(`
+      <h2>River flow</h2>
+      <div class="big num">${o.flow[0].value.toFixed(1)}<span class="unit">m³/s</span></div>
+      <div class="asof">${esc(o.flow[0].name)} &middot; ${escDate(o.flow[0].date)}</div>
+      <p class="lede">${pctLine(o.flow[0].percentile, 'of readings on record')}</p>
+      ${kvTable(o.flow.slice(0, 4).map(s => [esc(s.name), s.value.toFixed(1)]), ['Gauge', 'm³/s'])}
+    `, 'flow.html') : '';
+
+  const outlook = t.forecast
+    ? `<p class="lede" style="margin-top:14px;">Over the next seven days the water has historically ${
+        t.forecast.direction === 'hold steady' ? 'held steady'
+          : t.forecast.direction + 'ed by about ' + Math.abs(t.forecast.expectedChange).toFixed(1) + ' °C'
+      } from this point in the season, across ${t.forecast.yearsUsed} years.</p>` : '';
+
+  const body = `
+  ${staleNotice(lvl ? lvl.ageDays : null, 'gauge', 2)}
+  <div class="cards">${levelCard}${tempCard}${flowCard}</div>
+  ${outlook}
+  <div class="section">
+    <h2>Bala water level &middot; last 90 days</h2>
+    ${chartCard({
+      title: 'Bala — Lake Muskoka',
+      sub: 'Daily level against the five-year July average',
+      id: 'ch-level',
+      legend: `${sw('#2D6A9F')}Daily level ${sw('#E07B4C', 'dot')}Latest ${sw('#5BA88A')}July average`,
+    })}
+  </div>`;
+
+  const script = `
+Bala.getJSON('data/overview.json').then(function (o) {
+  if (!o.level) return;
+  var st = { name: o.level.name, unit: 'm', format: 'f3', decimals: 3, series: o.level.series };
+  Bala.charts.datedSeries(document.getElementById('ch-level'), st, 90, ${lvl && lvl.vsJulyIn !== null ? `${(lvl.value - lvl.vsJulyIn * 2.54 / 100).toFixed(4)}` : 'null'});
+});`;
+
+  return page({
+    file: 'index.html', title: 'Bala Bay — today',
+    heading: 'Today on the lake',
+    sub: `Level, temperature and flow as of the most recent reading from each source.`,
+    body, script,
+  });
+}
+
+function escDate(iso) {
+  const M = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const p = String(iso).split('-');
+  return `${M[parseInt(p[1], 10) - 1]} ${parseInt(p[2], 10)}, ${p[0]}`;
+}
+
+function temperaturePage(t) {
+  const s = t.stats;
+  const body = `
+  ${staleNotice(t.meta.lagDays, 'satellite', 4)}
+  <div class="cards">
+    ${card(`
+      <h2>Latest reading</h2>
+      <div class="big num">${t.latest.value.toFixed(1)}<span class="unit">°C</span><span class="alt">${Math.round(t.latest.value * 9 / 5 + 32)}°F</span></div>
+      <div class="asof">${escDate(t.latest.date)}</div>
+      ${s ? `<p class="lede">${pctLine(s.percentile, 'for this week of the year')}, and the ${ordinal(s.rank)} warmest of ${s.totalYears} years on record.</p>` : ''}
+      <div class="dist" id="dist-temp"></div>
+    `)}
+    ${card(`
+      <h2>This week of the year, ${s ? s.earliestYear + '–' + s.latestYear : ''}</h2>
+      ${s ? kvTable([
+        ['Today', t.latest.value.toFixed(1)],
+        ['Median', s.median.toFixed(1)],
+        ['Coldest on record', s.min.toFixed(1)],
+        ['Warmest on record', s.max.toFixed(1)],
+      ], ['', '°C']) : ''}
+      <p class="lede">Readings pooled from ${esc(escDate(s ? s.windowStart : ''))} to ${esc(escDate(s ? s.windowEnd : ''))} in every year on record.</p>
+    `)}
+    ${t.forecast ? card(`
+      <h2>Next seven days</h2>
+      <div class="big num">${t.forecast.direction === 'hold steady' ? 'Steady' : (t.forecast.expectedChange > 0 ? '+' : '') + t.forecast.expectedChange.toFixed(1)}${t.forecast.direction === 'hold steady' ? '' : '<span class="unit">°C</span>'}</div>
+      <div class="asof">typical change by ${escDate(t.forecast.futureDate)}</div>
+      <p class="lede">Based on what the water actually did over the same seven calendar days in ${t.forecast.yearsUsed} previous years. High confidence in direction, less in magnitude.</p>
+    `) : ''}
+  </div>
+
+  <div class="section">
+    <h2>${t.meta.years} years of readings</h2>
+    ${chartCard({
+      title: `${t.current.year} against the ${t.meta.years}-year record`,
+      sub: 'Shaded bands show the full range and the middle half of all previous years',
+      id: 'ch-clim',
+      toggles: [['season', 'This season', true], ['year', 'Full year', false], ['all', 'All years', false]],
+      legend: `${sw('#2D6A9F')}${t.current.year} ${sw('#C0392B')}${t.previous.year} ${sw('rgba(107,142,173,0.28)', 'band')}Middle half ${sw('rgba(107,142,173,0.16)', 'band')}Full range ${sw('#E07B4C', 'dot')}Latest`,
+    })}
+    ${explain('How the bands are built', `
+      <p>For every day of the year, all readings within ±3 days of it — in every year except the current one — are pooled together. The bands are the minimum, 25th percentile, 75th percentile and maximum of that pool.</p>
+      <code class="formula">pool(day)  = readings from day−3 … day+3, all years except ${t.current.year}
+full range = min(pool) … max(pool)
+middle half = 25th percentile(pool) … 75th percentile(pool)</code>
+      <p>The ±3-day window keeps a single noisy satellite reading from putting a notch in the envelope. It is the same window used for the ranking and the percentile, so all three describe the same set of readings.</p>`)}
+  </div>
+
+  <div class="section">
+    <h2>This year against normal</h2>
+    ${chartCard({
+      title: 'Daily difference from the median',
+      sub: `Each bar is that day's reading minus the ${t.meta.years}-year median for the same day`,
+      id: 'ch-anom', short: true,
+      legend: `${sw('#E07B4C')}Warmer than usual ${sw('#2D6A9F')}Cooler than usual`,
+    })}
+  </div>
+
+  <div class="section">
+    <h2>Yearly averages</h2>
+    ${kvTable(
+      t.yearMeans.slice().reverse().slice(0, 12).map(([y, mean, n]) =>
+        [String(y), mean.toFixed(1), String(n)]),
+      ['Year', 'Mean °C', 'Days'])}
+    <p class="lede">Mean of every reading in the year. Partial years (the first and the current) average fewer days and are not comparable to full ones.</p>
+  </div>`;
+
+  const script = `
+var T = ${JSON.stringify({
+    latest: t.latest, current: t.current, previous: t.previous,
+    climatology: t.climatology, anomaly: t.anomaly,
+  })};
+var chart = null, allYears = null;
+function draw(mode) {
+  if (chart) { chart.destroy(); chart = null; }
+  var el = document.getElementById('ch-clim');
+  if (mode === 'all') {
+    if (!allYears) {
+      Bala.getJSON('data/temperature-allyears.json').then(function (d) { allYears = d; draw('all'); });
+      return;
+    }
+    chart = Bala.charts.tempAllYears(el, allYears);
+  } else if (mode === 'year') {
+    chart = Bala.charts.tempClimatology(el, T, { xMin: 1, xMax: 366 });
+  } else {
+    chart = Bala.charts.tempClimatology(el, T, {
+      xMin: Math.max(1, T.latest.dayOfYear - 120), xMax: Math.min(366, T.latest.dayOfYear + 20)
+    });
+  }
+}
+draw('season');
+Bala.toggleGroup(document.getElementById('ch-clim-toggles'), draw);
+Bala.charts.tempAnomaly(document.getElementById('ch-anom'), T);
+Bala.renderDist(document.getElementById('dist-temp'), ${JSON.stringify(t.dist)}, ${t.latest.value}, 'f1', '°C');`;
+
+  return page({
+    file: 'temperature.html', title: 'Bala Bay — water temperature',
+    heading: 'Water temperature',
+    sub: `${t.meta.records.toLocaleString('en-CA')} daily satellite readings, ${escDate(t.meta.firstDate)} to ${escDate(t.meta.lastDate)}.`,
+    body, script,
+  });
+}
+
+function stationPage({ file, title, heading, sub, payload, comparison, note }) {
+  const cards = payload.stations.map(st => card(`
+      <h2>${esc(st.name)} &middot; ${esc(st.label)}</h2>
+      <div class="big num">${st.latest.value.toFixed(st.decimals)}<span class="unit">${esc(st.unit)}</span></div>
+      <div class="asof">${escDate(st.latest.date)}${st.vsJulyIn !== null ? ` &middot; ${st.vsJulyIn > 0 ? '+' : ''}${st.vsJulyIn.toFixed(1)} in vs July avg` : ''}</div>
+      <p class="lede">${pctLine(st.percentile, `of ${st.n} days on record`)}</p>
+      ${kvTable([
+        ['1-day change', fmtChange(st.changes.d1, st.decimals)],
+        ['7-day change', fmtChange(st.changes.d7, st.decimals)],
+        ['30-day change', fmtChange(st.changes.d30, st.decimals)],
+      ], ['', st.unit])}
+      <div class="dist" id="dist-${st.id}"></div>
+    `)).join('\n    ');
+
+  const charts = payload.stations.map(st => chartCard({
+    title: `${st.name} — ${st.label}`,
+    sub: `${st.n} days on record &middot; latest ${st.latest.value.toFixed(st.decimals)} ${st.unit}`,
+    id: `ch-${st.id}`,
+    toggles: [['90', '90 days', true], ['365', '1 year', false], ['9999', 'All', false]],
+    legend: `${sw('#2D6A9F')}Daily ${sw('#E07B4C', 'dot')}Latest${st.julyAvg !== null ? ` ${sw('#5BA88A')}July average` : ''}`,
+  })).join('\n    ');
+
+  const cmp = (comparison && payload.comparison && payload.comparison.series.length) ? `
+  <div class="section">
+    <h2>All gauges compared</h2>
+    ${chartCard({
+      title: 'Inches above or below each gauge’s own July average',
+      sub: 'The only fair comparison between these gauges — see the note below',
+      id: 'ch-cmp',
+      toggles: [['90', '90 days', true], ['365', '1 year', false], ['9999', 'All', false]],
+      legend: payload.comparison.stations.map((s, i) =>
+        `${sw(['#2D6A9F', '#E07B4C', '#5BA88A', '#C0392B', '#7B5EA7'][i % 5])}${esc(s.name)}`).join(' '),
+    })}
+    ${explain('Why these gauges cannot share a raw axis', `
+      <p>The five level gauges are surveyed to different datums. Bala reads about 225 m above sea level; the others read between 0 and 10 m on local gauge datums. Plotting them together raw would say nothing except which datum each surveyor chose.</p>
+      <code class="formula">value = (level − that gauge's 5-year July mean) ÷ 2.54 cm per inch</code>
+      <p>Subtracting each gauge's own July average removes the datum and leaves the part that is actually comparable: how high the water is running for the season.</p>`)}
+  </div>` : '';
+
+  const script = `
+Bala.getJSON('data/${file.replace('.html', '')}.json').then(function (d) {
+  d.stations.forEach(function (st) {
+    var chart = null;
+    function draw(days) {
+      if (chart) chart.destroy();
+      chart = Bala.charts.datedSeries(document.getElementById('ch-' + st.id), st, parseInt(days, 10), st.julyAvg);
+    }
+    draw(90);
+    Bala.toggleGroup(document.getElementById('ch-' + st.id + '-toggles'), draw);
+    Bala.renderDist(document.getElementById('dist-' + st.id), st.dist, st.latest.value, st.format, st.unit);
+  });
+  ${comparison ? `
+  if (d.comparison && d.comparison.series.length) {
+    var c = null;
+    function drawCmp(days) {
+      if (c) c.destroy();
+      c = Bala.charts.comparison(document.getElementById('ch-cmp'), d.comparison, parseInt(days, 10));
+    }
+    drawCmp(90);
+    Bala.toggleGroup(document.getElementById('ch-cmp-toggles'), drawCmp);
+  }` : ''}
+});`;
+
+  return page({
+    file, title, heading, sub,
+    body: `${note}<div class="cards">${cards}</div>\n  <div class="section">${charts}</div>${cmp}`,
+    script,
+  });
+}
+
+function fmtChange(c, decimals) {
+  if (!c) return '—';
+  const v = c.change;
+  return `${v > 0 ? '+' : ''}${v.toFixed(decimals)}`;
+}
+
+function aboutPage(temp, levels, flow) {
+  const omitted = flow.omitted.length
+    ? `<p>${flow.omitted.map(o => `Gauge ${esc(o.id)} (${esc(o.name)}) is not shown: its most recent reading is from ${escDate(o.lastDate)}.`).join(' ')}</p>`
+    : '';
+  const body = `
+  <div class="card">
+    <h2>Where the numbers come from</h2>
+    <p class="lede"><strong>Water level and river flow</strong> come from Environment and Climate Change Canada's MSC GeoMet API — the same public gauge network as the Water Office. Bala is station 02EB015. Readings are daily means, backfilled with sub-daily realtime values for days the daily-mean series has not published yet.</p>
+    <p class="lede"><strong>Water temperature</strong> comes from NOAA's MUR SST v4.1 satellite analysis, sampled at ${'45.01'}° N, ${'79.6'}° W. It is a surface analysis of a 0.01° cell, not a thermometer in the water, and it lags real time by two to three days. Every temperature on this site is labelled with the date it was actually measured.</p>
+  </div>
+
+  <div class="card" style="margin-top:14px;">
+    <h2>How often it updates</h2>
+    <p class="lede">A scheduled job runs each morning at 7am Eastern: it fetches new readings, sends the daily email, and rebuilds these pages. If a source is unreachable that morning, the previous reading stays in place and the notices above say how old it is.</p>
+  </div>
+
+  <div class="card" style="margin-top:14px;">
+    <h2>Reading the numbers</h2>
+    <p class="lede"><strong>Percentiles</strong> describe where a reading sits in the record — "16th percentile" means 16% of comparable readings were lower. Neither warmer nor higher is treated as better, because for a lake neither is.</p>
+    <p class="lede"><strong>Datums.</strong> Each level gauge is surveyed to its own reference. Raw levels are comparable only against that same gauge's history, never against another gauge. The comparison chart on the levels page normalises this away.</p>
+    <p class="lede"><strong>Averages against July.</strong> "vs July avg" compares against the mean of every July day in the five years of daily means fetched for that station — a stable warm-season baseline, not a same-date comparison.</p>
+    ${omitted}
+  </div>
+
+  <div class="card" style="margin-top:14px;">
+    <h2>Coverage</h2>
+    ${kvTable([
+      ['Water temperature', `${escDate(temp.meta.firstDate)} – ${escDate(temp.meta.lastDate)}`, temp.meta.records.toLocaleString('en-CA')],
+      ...levels.stations.map(s => [`Level · ${esc(s.name)}`, `${escDate(s.firstDate)} – ${escDate(s.lastDate)}`, String(s.n)]),
+      ...flow.stations.map(s => [`Flow · ${esc(s.name)}`, `${escDate(s.firstDate)} – ${escDate(s.lastDate)}`, String(s.n)]),
+    ], ['Series', 'Range', 'Readings'])}
+  </div>`;
+
+  return page({
+    file: 'about.html', title: 'Bala Bay — about the data',
+    heading: 'About the data', sub: 'Sources, update cadence, and what the numbers mean.',
+    body, script: '',
+  });
+}
+
+// ── build ──
+
+async function writeJSON(name, obj) {
+  const text = JSON.stringify(obj);
+  const kb = Buffer.byteLength(text) / 1024;
+  await fs.writeFile(DOCS + 'data/' + name, text, 'utf8');
+  const flag = kb > PAYLOAD_WARN_KB ? '  ⚠ over ' + PAYLOAD_WARN_KB + 'KB' : '';
+  console.log(`  data/${name.padEnd(28)} ${kb.toFixed(1).padStart(7)} KB${flag}`);
+  if (kb > PAYLOAD_WARN_KB) process.exitCode = 0; // warn, don't fail
+  return kb;
+}
+
+async function main() {
+  console.log('Building site from data/ (no network)...');
+
+  const [temps, cache] = await Promise.all([loadTemps(), loadLevelCache()]);
+  const temp = buildTemperaturePayload(temps, CURRENT_YEAR, TODAY_ISO);
+  const allYears = buildAllYearsPayload(temps, CURRENT_YEAR);
+  const levels = buildLevelsPayload(cache, TODAY_ISO);
+  const flow = buildFlowPayload(cache, TODAY_ISO);
+  const overview = buildOverviewPayload(temp, levels, flow, TODAY_ISO);
+
+  console.log(`  ${temps.length} temperature readings, ${temp.meta.years} years`);
+  console.log(`  ${levels.stations.length} level gauges, ${flow.stations.length} flow gauges` +
+    (flow.omitted.length ? ` (${flow.omitted.length} omitted as stale)` : ''));
+
+  await fs.mkdir(DOCS + 'data', { recursive: true });
+  await fs.mkdir(DOCS + 'assets', { recursive: true });
+
+  await writeJSON('overview.json', overview);
+  await writeJSON('temperature.json', temp);
+  await writeJSON('temperature-allyears.json', allYears);
+  await writeJSON('levels.json', levels);
+  await writeJSON('flow.json', flow);
+
+  const pages = {
+    'index.html': indexPage(overview, temp),
+    'temperature.html': temperaturePage(temp),
+    'levels.html': stationPage({
+      file: 'levels.html', title: 'Bala Bay — water levels',
+      heading: 'Water levels', sub: 'Five gauges around Lake Muskoka and Lake Rosseau.',
+      payload: levels, comparison: true,
+      note: staleNotice(overview.level ? overview.level.ageDays : null, 'gauge', 2),
+    }),
+    'flow.html': stationPage({
+      file: 'flow.html', title: 'Bala Bay — river flow',
+      heading: 'River flow', sub: 'Discharge on the Muskoka and Indian rivers.',
+      payload: flow, comparison: false, note: '',
+    }),
+    'about.html': aboutPage(temp, levels, flow),
+  };
+
+  for (const [name, html] of Object.entries(pages)) {
+    await fs.writeFile(DOCS + name, html, 'utf8');
+    console.log(`  ${name.padEnd(33)} ${(Buffer.byteLength(html) / 1024).toFixed(1).padStart(7)} KB`);
+  }
+
+  // Assets: stylesheet, renderer, and the vendored charting library. Vendored
+  // rather than pulled from a CDN so the site works in networks and sandboxes
+  // that block third-party origins, and cannot break when a CDN changes.
+  await fs.copyFile(here + 'lib/site.css', DOCS + 'assets/site.css');
+  await fs.copyFile(here + 'lib/app.js', DOCS + 'assets/app.js');
+  await fs.copyFile(ROOT + 'node_modules/chart.js/dist/chart.umd.js', DOCS + 'assets/chart.umd.js');
+
+  await fs.writeFile(DOCS + 'robots.txt', 'User-agent: *\nDisallow: /\n', 'utf8');
+  await fs.writeFile(DOCS + '404.html', page({
+    file: '', title: 'Bala Bay — not found', heading: 'Not found',
+    sub: 'That page does not exist.',
+    body: '<div class="card"><p class="lede"><a href="index.html">Back to today’s conditions</a></p></div>',
+    script: '',
+  }), 'utf8');
+  // Pages would otherwise run the output through Jekyll
+  await fs.writeFile(DOCS + '.nojekyll', '', 'utf8');
+
+  console.log('Done → docs/');
+}
+
+main().catch(err => {
+  console.error("❌ Site build failed:", err.stack);
+  process.exit(1);
+});

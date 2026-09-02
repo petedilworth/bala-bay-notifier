@@ -77,10 +77,31 @@ vs 5-Year July Average: +3.2 cm
 
 ---
 
+## The dashboard site
+
+Alongside the email, a static dashboard is generated into `docs/` and served by
+GitHub Pages. It carries the full archive the email can't: 25 years of daily
+water temperature, plus level and flow history for every gauge.
+
+```bash
+npm run build:site   # reads data/, writes docs/ — no network, no secrets
+```
+
+The generator does all the data shaping; `docs/assets/app.js` only formats
+numbers and draws charts. Chart.js is vendored into `docs/assets/` rather than
+loaded from a CDN, so the site works anywhere.
+
+To publish: repo **Settings → Pages → Source: deploy from branch, `main`,
+folder `/docs`**. The daily workflow rebuilds and commits `docs/` each morning.
+Pages are marked `noindex` and `robots.txt` disallows crawling.
+
+---
+
 ## Running it locally
 
 ```bash
 npm install
+npm test             # 23 unit tests over the data logic
 
 # Build the email and write preview.html / preview.txt — no secrets, no send.
 # Open preview.html in a browser to see exactly what would go out.

@@ -1,0 +1,182 @@
+/* Bala Bay dashboard — palette lifted from the daily email so the two read as
+   one product. Series colours match the emailed PNGs exactly. */
+
+:root {
+  --page: #F4F0EB;
+  --surface: #FFFFFF;
+  --surface-2: #FAF8F5;
+  --ink: #0B1D33;
+  --ink-2: #4A4A4A;
+  --muted: #6B6B6B;
+  --faint: #999999;
+  --grid: #E0DAD2;
+
+  --blue: #2D6A9F;      /* primary series */
+  --blue-soft: rgba(74, 155, 217, 0.18);
+  --green: #5BA88A;     /* reference lines (July average) */
+  --orange: #E07B4C;    /* latest reading, "warmer than usual" */
+  --red: #C0392B;       /* alerts only */
+
+  --radius: 10px;
+  --maxw: 1100px;
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font: 15px/1.55 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+/* Every number in the document, so columns line up */
+.num, td.n, .stat-value, .big { font-variant-numeric: tabular-nums; }
+
+a { color: var(--blue); }
+
+.wrap { max-width: var(--maxw); margin: 0 auto; padding: 20px 16px 56px; }
+
+/* ── header / nav ── */
+
+header.site { border-bottom: 1px solid var(--grid); margin-bottom: 22px; }
+header.site .wrap { padding-bottom: 0; }
+.brand { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.brand h1 { margin: 0; font-size: 19px; letter-spacing: -0.01em; }
+.brand .sub { color: var(--muted); font-size: 12px; }
+
+nav.site { display: flex; gap: 2px; margin-top: 14px; flex-wrap: wrap; }
+nav.site a {
+  padding: 7px 12px; font-size: 13px; text-decoration: none;
+  color: var(--muted); border-bottom: 2px solid transparent;
+}
+nav.site a:hover { color: var(--ink); }
+nav.site a[aria-current="page"] { color: var(--ink); font-weight: 600; border-bottom-color: var(--blue); }
+
+/* ── notices ── */
+
+.notice {
+  background: #FDF3EF; border: 1px solid #F0C9B8; color: #8A3A1C;
+  border-radius: var(--radius); padding: 10px 13px; font-size: 13px; margin-bottom: 16px;
+}
+
+/* ── cards ── */
+
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+
+.card {
+  background: var(--surface); border: 1px solid var(--grid);
+  border-radius: var(--radius); padding: 16px;
+}
+.card h2, .section h2 {
+  margin: 0 0 4px; font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+}
+a.card { text-decoration: none; color: inherit; display: block; }
+a.card:hover { border-color: var(--blue); }
+
+.big { font-size: 34px; font-weight: 700; line-height: 1.1; }
+.big .unit { font-size: 15px; font-weight: 400; color: var(--muted); margin-left: 3px; }
+.big .alt { font-size: 16px; font-weight: 400; color: var(--muted); margin-left: 6px; }
+.asof { font-size: 11px; color: var(--faint); margin-top: 3px; }
+.lede { font-size: 13px; color: var(--ink-2); margin: 8px 0 0; }
+
+/* ── tables ── */
+
+table.kv { width: 100%; border-collapse: collapse; margin-top: 12px; }
+table.kv th, table.kv td {
+  padding: 5px 6px; font-size: 12px; text-align: right;
+  border-bottom: 1px solid #F0EDE8; white-space: nowrap;
+}
+table.kv th { color: var(--muted); font-weight: 600; font-size: 10px;
+  text-transform: uppercase; letter-spacing: 0.04em; border-bottom: 2px solid var(--grid); }
+table.kv th:first-child, table.kv td:first-child { text-align: left; }
+table.kv tr:last-child td { border-bottom: none; }
+.table-scroll { overflow-x: auto; }
+
+/* ── distribution strip ── */
+/* min · p25 · median · p75 · max with the current value marked. A sparkline
+   with no axis tells the reader nothing about range; this does. */
+
+.dist { margin-top: 14px; }
+.dist-track {
+  position: relative; height: 26px; margin: 16px 0 4px;
+  background: linear-gradient(to right, var(--surface-2), var(--surface-2));
+  border-radius: 4px;
+}
+.dist-box {
+  position: absolute; top: 6px; height: 14px;
+  background: var(--blue-soft); border: 1px solid var(--blue);
+  border-radius: 3px;
+}
+.dist-median { position: absolute; top: 2px; height: 22px; width: 2px; background: var(--blue); }
+.dist-marker { position: absolute; top: 0; height: 26px; width: 3px; background: var(--orange); border-radius: 2px; }
+.dist-marker::after {
+  content: attr(data-label); position: absolute; top: -15px; left: 50%;
+  transform: var(--label-shift, translateX(-50%)); font-size: 10px; color: var(--orange);
+  font-weight: 600; white-space: nowrap;
+}
+.dist-scale { display: flex; justify-content: space-between; font-size: 10px; color: var(--faint); }
+
+/* ── charts ── */
+
+.section { margin-top: 26px; }
+.chart-card {
+  background: var(--surface); border: 1px solid var(--grid);
+  border-radius: var(--radius); padding: 14px 16px 10px; margin-top: 12px;
+}
+.chart-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.chart-title { font-size: 14px; font-weight: 600; }
+.chart-sub { font-size: 11px; color: var(--muted); }
+.chart-box { position: relative; height: 260px; margin-top: 10px; }
+.chart-box.short { height: 190px; }
+.legend { margin-top: 8px; font-size: 11px; color: var(--muted); display: flex; gap: 14px; flex-wrap: wrap; }
+.legend .swatch { display: inline-block; width: 16px; height: 3px; vertical-align: middle; margin-right: 5px; border-radius: 2px; }
+.legend .swatch.dot { width: 9px; height: 9px; border-radius: 50%; }
+.legend .swatch.band { height: 10px; border-radius: 2px; }
+
+/* period toggles */
+.toggles { display: flex; gap: 4px; flex-wrap: wrap; }
+.toggles button {
+  font: inherit; font-size: 12px; padding: 4px 10px; cursor: pointer;
+  background: var(--surface-2); color: var(--muted);
+  border: 1px solid var(--grid); border-radius: 6px;
+}
+.toggles button:hover { color: var(--ink); }
+.toggles button[aria-pressed="true"] { background: var(--blue); border-color: var(--blue); color: #fff; font-weight: 600; }
+
+/* ── explainer ── */
+
+details.explain {
+  margin-top: 12px; background: var(--surface); border: 1px solid var(--grid);
+  border-radius: var(--radius); padding: 0 14px;
+}
+details.explain > summary {
+  cursor: pointer; padding: 11px 0; font-size: 12px; font-weight: 600; color: var(--muted);
+}
+details.explain[open] > summary { border-bottom: 1px solid var(--grid); margin-bottom: 10px; }
+details.explain .body { padding-bottom: 12px; font-size: 13px; color: var(--ink-2); }
+details.explain p { margin: 0 0 9px; }
+code.formula {
+  display: block; background: var(--surface-2); border: 1px solid var(--grid);
+  border-radius: 6px; padding: 9px 11px; font-size: 12px; margin: 0 0 10px;
+  overflow-x: auto; white-space: pre-wrap; color: var(--ink);
+}
+
+footer.site { margin-top: 34px; padding-top: 14px; border-top: 1px solid var(--grid);
+  font-size: 11px; color: var(--faint); }
+footer.site a { color: var(--muted); }
+
+/* ── one breakpoint ── */
+
+@media (max-width: 640px) {
+  .wrap { padding: 16px 12px 40px; }
+  .big { font-size: 28px; }
+  .chart-box { height: 220px; }
+  /* Range buttons crowd the legend at this width — the spec's call, and it
+     holds here too. Charts keep their default window. */
+  .toggles { display: none; }
+  .chart-head { gap: 4px; }
+}

@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Public gauge data, but this is a personal dashboard — keep it out of search results. -->
+<meta name="robots" content="noindex, nofollow">
+<title>Bala Bay — today</title>
+<!-- Inline so the browser never fires a request for /favicon.ico -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%8C%8A%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<header class="site">
+  <div class="wrap">
+    <div class="brand">
+      <h1>🌊 Bala Bay</h1>
+      <span class="sub">Lake Muskoka water conditions</span>
+    </div>
+    <nav class="site">
+      <a href="index.html" aria-current="page">Today</a>
+      <a href="temperature.html">Temperature</a>
+      <a href="levels.html">Water levels</a>
+      <a href="flow.html">River flow</a>
+      <a href="about.html">About</a>
+    </nav>
+  </div>
+</header>
+<main class="wrap">
+  <h2 style="margin:0 0 2px;font-size:22px;">Today on the lake</h2>
+  <p style="margin:0 0 18px;color:var(--muted);font-size:13px;">Level, temperature and flow as of the most recent reading from each source.</p>
+
+  
+  <div class="cards"><a class="card" href="levels.html">
+      <h2>Water level · Bala</h2>
+      <div class="big num">-0.4<span class="unit">in vs July avg</span></div>
+      <div class="asof">225.311 m &middot; Sep 2, 2026</div>
+      <p class="lede">52nd percentile of the last 400 days on record</p>
+      <div class="table-scroll"><table class="kv">
+    <tr><th></th><th>metres</th></tr>
+    <tr><td>Latest</td><td class="n">225.311</td></tr>
+    <tr><td>7-day mean</td><td class="n">225.301</td></tr>
+    <tr><td>30-day mean</td><td class="n">225.321</td></tr>
+  </table></div>
+    </a><a class="card" href="temperature.html">
+      <h2>Water temperature</h2>
+      <div class="big num">19.9<span class="unit">°C</span><span class="alt">68°F</span></div>
+      <div class="asof">Aug 29, 2026 &middot; satellite lags 4 days</div>
+      <p class="lede">18th percentile for this time of year across 25 years &middot; 22nd warmest of 25</p>
+      <div class="table-scroll"><table class="kv">
+    <tr><th></th><th>°C</th></tr>
+    <tr><td>Today</td><td class="n">19.9</td></tr>
+    <tr><td>Typical (median)</td><td class="n">21.3</td></tr>
+    <tr><td>Range on record</td><td class="n">18.2–24.8</td></tr>
+  </table></div>
+    </a><a class="card" href="flow.html">
+      <h2>River flow</h2>
+      <div class="big num">5.4<span class="unit">m³/s</span></div>
+      <div class="asof">Bracebridge &middot; Sep 2, 2026</div>
+      <p class="lede">46th percentile of readings on record</p>
+      <div class="table-scroll"><table class="kv">
+    <tr><th>Gauge</th><th>m³/s</th></tr>
+    <tr><td>Bracebridge</td><td class="n">5.4</td></tr>
+    <tr><td>Port Sydney</td><td class="n">9.3</td></tr>
+    <tr><td>Baysville</td><td class="n">16.6</td></tr>
+    <tr><td>Port Carling</td><td class="n">1.8</td></tr>
+  </table></div>
+    </a></div>
+  <p class="lede" style="margin-top:14px;">Over the next seven days the water has historically cooled by about 0.4 °C from this point in the season, across 24 years.</p>
+  <div class="section">
+    <h2>Bala water level &middot; last 90 days</h2>
+    <div class="chart-card">
+    <div class="chart-head">
+      <div>
+        <div class="chart-title">Bala — Lake Muskoka</div>
+        <div class="chart-sub">Daily level against the five-year July average</div>
+      </div>
+      
+    </div>
+    <div class="chart-box"><canvas id="ch-level"></canvas></div>
+    <div class="legend"><span class="swatch " style="background:#2D6A9F"></span>Daily level <span class="swatch dot" style="background:#E07B4C"></span>Latest <span class="swatch " style="background:#5BA88A"></span>July average</div>
+  </div>
+  </div>
+  <footer class="site">
+    Gauge data: Environment and Climate Change Canada, MSC GeoMet (station 02EB015 and neighbours).
+    Water temperature: NOAA MUR SST v4.1 satellite analysis.<br>
+    Rebuilt automatically each morning. Generated 2026-09-02.
+  </footer>
+</main>
+<script src="assets/chart.umd.js"></script>
+<script src="assets/app.js"></script>
+<script>
+
+Bala.getJSON('data/overview.json').then(function (o) {
+  if (!o.level) return;
+  var st = { name: o.level.name, unit: 'm', format: 'f3', decimals: 3, series: o.level.series };
+  Bala.charts.datedSeries(document.getElementById('ch-level'), st, 90, 225.3212);
+});
+</script>
+</body>
+</html>

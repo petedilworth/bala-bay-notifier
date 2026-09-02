@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Public gauge data, but this is a personal dashboard — keep it out of search results. -->
+<meta name="robots" content="noindex, nofollow">
+<title>Bala Bay — about the data</title>
+<!-- Inline so the browser never fires a request for /favicon.ico -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%8C%8A%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+<header class="site">
+  <div class="wrap">
+    <div class="brand">
+      <h1>🌊 Bala Bay</h1>
+      <span class="sub">Lake Muskoka water conditions</span>
+    </div>
+    <nav class="site">
+      <a href="index.html">Today</a>
+      <a href="temperature.html">Temperature</a>
+      <a href="levels.html">Water levels</a>
+      <a href="flow.html">River flow</a>
+      <a href="about.html" aria-current="page">About</a>
+    </nav>
+  </div>
+</header>
+<main class="wrap">
+  <h2 style="margin:0 0 2px;font-size:22px;">About the data</h2>
+  <p style="margin:0 0 18px;color:var(--muted);font-size:13px;">Sources, update cadence, and what the numbers mean.</p>
+
+  <div class="card">
+    <h2>Where the numbers come from</h2>
+    <p class="lede"><strong>Water level and river flow</strong> come from Environment and Climate Change Canada's MSC GeoMet API — the same public gauge network as the Water Office. Bala is station 02EB015. Readings are daily means, backfilled with sub-daily realtime values for days the daily-mean series has not published yet.</p>
+    <p class="lede"><strong>Water temperature</strong> comes from NOAA's MUR SST v4.1 satellite analysis, sampled at 45.01° N, 79.6° W. It is a surface analysis of a 0.01° cell, not a thermometer in the water, and it lags real time by two to three days. Every temperature on this site is labelled with the date it was actually measured.</p>
+  </div>
+
+  <div class="card" style="margin-top:14px;">
+    <h2>How often it updates</h2>
+    <p class="lede">A scheduled job runs each morning at 7am Eastern: it fetches new readings, sends the daily email, and rebuilds these pages. If a source is unreachable that morning, the previous reading stays in place and the notices above say how old it is.</p>
+  </div>
+
+  <div class="card" style="margin-top:14px;">
+    <h2>Reading the numbers</h2>
+    <p class="lede"><strong>Percentiles</strong> describe where a reading sits in the record — "16th percentile" means 16% of comparable readings were lower. Neither warmer nor higher is treated as better, because for a lake neither is.</p>
+    <p class="lede"><strong>Datums.</strong> Each level gauge is surveyed to its own reference. Raw levels are comparable only against that same gauge's history, never against another gauge. The comparison chart on the levels page normalises this away.</p>
+    <p class="lede"><strong>Averages against July.</strong> "vs July avg" compares against the mean of every July day in the five years of daily means fetched for that station — a stable warm-season baseline, not a same-date comparison.</p>
+    <p>Gauge 02EB006 (Bala) is not shown: its most recent reading is from Dec 31, 2021.</p>
+  </div>
+
+  <div class="card" style="margin-top:14px;">
+    <h2>Coverage</h2>
+    <div class="table-scroll"><table class="kv">
+    <tr><th>Series</th><th>Range</th><th>Readings</th></tr>
+    <tr><td>Water temperature</td><td class="n">Jun 1, 2002 – Aug 29, 2026</td><td class="n">8,854</td></tr>
+    <tr><td>Level · Bala</td><td class="n">Feb 23, 2025 – Sep 2, 2026</td><td class="n">400</td></tr>
+    <tr><td>Level · Beaumaris</td><td class="n">Feb 24, 2024 – Sep 2, 2026</td><td class="n">400</td></tr>
+    <tr><td>Level · Port Carling</td><td class="n">Feb 24, 2024 – Sep 2, 2026</td><td class="n">400</td></tr>
+    <tr><td>Level · Port Sydney</td><td class="n">Feb 24, 2024 – Sep 2, 2026</td><td class="n">400</td></tr>
+    <tr><td>Level · Baysville</td><td class="n">Feb 19, 2024 – Sep 2, 2026</td><td class="n">400</td></tr>
+    <tr><td>Flow · Bracebridge</td><td class="n">Feb 24, 2024 – Sep 2, 2026</td><td class="n">400</td></tr>
+    <tr><td>Flow · Port Sydney</td><td class="n">Feb 24, 2024 – Sep 2, 2026</td><td class="n">400</td></tr>
+    <tr><td>Flow · Baysville</td><td class="n">Feb 24, 2024 – Sep 2, 2026</td><td class="n">400</td></tr>
+    <tr><td>Flow · Port Carling</td><td class="n">Feb 24, 2024 – Sep 2, 2026</td><td class="n">400</td></tr>
+  </table></div>
+  </div>
+  <footer class="site">
+    Gauge data: Environment and Climate Change Canada, MSC GeoMet (station 02EB015 and neighbours).
+    Water temperature: NOAA MUR SST v4.1 satellite analysis.<br>
+    Rebuilt automatically each morning. Generated 2026-09-02.
+  </footer>
+</main>
+<script src="assets/chart.umd.js"></script>
+<script src="assets/app.js"></script>
+<script>
+
+</script>
+</body>
+</html>
