@@ -133,7 +133,7 @@ function indexPage(o, temp) {
       <h2>Water level · ${esc(lvl.name)}</h2>
       <div class="big num">${lvl.vsJulyIn === null ? '—' : (lvl.vsJulyIn > 0 ? '+' : '') + lvl.vsJulyIn.toFixed(1)}<span class="unit">in vs July avg</span></div>
       <div class="asof">${lvl.value.toFixed(3)} m &middot; ${escDate(lvl.date)}</div>
-      <p class="lede">${pctLine(lvl.percentile, `of the last ${lvl.dist.n} days on record`)}</p>
+      <p class="lede">${pctLine(lvl.percentile, `of ${lvl.dist.n.toLocaleString('en-CA')} readings on record`)}</p>
       ${kvTable([
         ['Latest', lvl.value.toFixed(3)],
         ['7-day mean', lvl.trailing.d7 === null ? '—' : lvl.trailing.d7.toFixed(3)],
@@ -309,7 +309,7 @@ function stationPage({ file, title, heading, sub, payload, comparison, note }) {
       <h2>${esc(st.name)} &middot; ${esc(st.label)}</h2>
       <div class="big num">${st.latest.value.toFixed(st.decimals)}<span class="unit">${esc(st.unit)}</span></div>
       <div class="asof">${escDate(st.latest.date)}${st.vsJulyIn !== null ? ` &middot; ${st.vsJulyIn > 0 ? '+' : ''}${st.vsJulyIn.toFixed(1)} in vs July avg` : ''}</div>
-      <p class="lede">${pctLine(st.percentile, `of ${st.n} days on record`)}</p>
+      <p class="lede">${pctLine(st.percentile, `of ${st.n.toLocaleString('en-CA')} readings since ${st.firstDate.substring(0, 4)}`)}</p>
       ${kvTable([
         ['1-day change', fmtChange(st.changes.d1, st.decimals)],
         ['7-day change', fmtChange(st.changes.d7, st.decimals)],
@@ -320,10 +320,10 @@ function stationPage({ file, title, heading, sub, payload, comparison, note }) {
 
   const charts = payload.stations.map(st => chartCard({
     title: `${st.name} — ${st.label}`,
-    sub: `${st.n} days on record &middot; latest ${st.latest.value.toFixed(st.decimals)} ${st.unit}`,
+    sub: `${st.n.toLocaleString('en-CA')} readings, ${escDate(st.firstDate)} to ${escDate(st.lastDate)}`,
     id: `ch-${st.id}`,
-    toggles: [['90', '90 days', true], ['365', '1 year', false], ['9999', 'All', false]],
-    legend: `${sw('#2D6A9F')}Daily ${sw('#E07B4C', 'dot')}Latest${st.julyAvg !== null ? ` ${sw('#5BA88A')}July average` : ''}`,
+    toggles: [['90', '90 days', true], ['365', '1 year', false], ['730', '2 years', false], ['9999', `All ${st.years}y`, false]],
+    legend: `${sw('#2D6A9F')}Daily ${sw('#E07B4C', 'dot')}Latest${st.julyAvg !== null ? ` ${sw('#5BA88A')}July avg (${st.julyAvgYears}-yr)` : ''} &middot; the "All" view is monthly means`,
   })).join('\n    ');
 
   const cmp = (comparison && payload.comparison && payload.comparison.series.length) ? `
@@ -333,7 +333,7 @@ function stationPage({ file, title, heading, sub, payload, comparison, note }) {
       title: 'Inches above or below each gauge’s own July average',
       sub: 'The only fair comparison between these gauges — see the note below',
       id: 'ch-cmp',
-      toggles: [['90', '90 days', true], ['365', '1 year', false], ['9999', 'All', false]],
+      toggles: [['90', '90 days', true], ['365', '1 year', false], ['730', '2 years', false]],
       legend: payload.comparison.stations.map((s, i) =>
         `${sw(['#2D6A9F', '#E07B4C', '#5BA88A', '#C0392B', '#7B5EA7'][i % 5])}${esc(s.name)}`).join(' '),
     })}

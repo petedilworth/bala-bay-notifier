@@ -52,6 +52,12 @@
     return MONTHS[parseInt(p[1], 10) - 1] + ' ' + parseInt(p[2], 10);
   }
 
+  function monthLabel(iso, withYear) {
+    var p = String(iso).split('-');
+    var m = MONTHS[parseInt(p[1], 10) - 1];
+    return withYear === undefined ? m + ' ' + p[0] : m + ' ' + p[0];
+  }
+
   function longDate(iso) {
     if (!iso) return '—';
     var p = String(iso).split('-');
@@ -279,14 +285,24 @@
 
   // Dated series (level / flow). x is an index into `labels` so gaps in the
   // record stay visible as gaps rather than being interpolated away.
+  //
+  // Only the recent years ship at daily resolution; the deep archive comes as
+  // monthly means, so the whole-record view reads from that instead. Both are
+  // dated series, so the same drawing code handles them.
   function datedSeries(canvas, station, days, refLine) {
-    var rows = breakGaps(windowByDate(station.series, days));
+    var monthly = days >= 9999 && station.monthly && station.monthly.length > 0;
+    var source = monthly
+      ? station.monthly.map(function (m) { return [m[0], m[1]]; })
+      : station.series;
+    // A monthly series steps ~30 days at a time; the daily gap rule would break
+    // it at every point.
+    var rows = monthly ? breakGaps(source, 62) : breakGaps(windowByDate(source, days));
     var labels = rows.map(function (r) { return r[0]; });
     var values = rows.map(function (r) { return r[1]; });
     var b = pad(values, refLine === null || refLine === undefined ? [] : [refLine], 0.15, station.decimals === 3 ? 0.01 : 0.1);
 
     var ds = [{
-      label: station.name,
+      label: monthly ? 'Monthly mean' : station.name,
       data: values.map(function (v, i) { return { x: i, y: v }; }),
       borderColor: C.blue, backgroundColor: C.blueSoft,
       borderWidth: 2, fill: 'start', tension: 0.25, spanGaps: false,
@@ -307,8 +323,15 @@
       options: baseOptions({
         xMin: 0, xMax: values.length - 1, yMin: b.min, yMax: b.max,
         yLabel: station.unit, yFormat: station.format, unit: station.unit,
-        xTick: function (v) { return labels[v] ? shortDate(labels[v]) : ''; },
-        tipTitle: function (item) { return labels[item.parsed.x] ? longDate(labels[item.parsed.x]) : ''; }
+        xTick: function (v) {
+          if (!labels[v]) return '';
+          return monthly ? monthLabel(labels[v]) : shortDate(labels[v]);
+        },
+        tipTitle: function (item) {
+          var d = labels[item.parsed.x];
+          if (!d) return '';
+          return monthly ? monthLabel(d, true) : longDate(d);
+        }
       })
     });
   }

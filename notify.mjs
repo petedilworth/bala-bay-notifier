@@ -327,48 +327,140 @@ async function saveTempCache(records) {
   await fs.writeFile(TEMP_CSV_PATH, 'date,tempC\n' + rows.join('\n') + '\n', 'utf8');
 }
 
-// ── Daily level/flow observation cache ──
-// The realtime API only keeps ~1 month and daily means lag months behind, so
-// observed daily values are cached in the repo (like the temp cache) to let
-// the charts show a full trailing window.
-
-const LEVEL_CACHE_PATH = __dirname + 'data/level-history.json';
-
-let levelCachePromise = null;
-function getLevelCache() {
-  if (!levelCachePromise) {
-    levelCachePromise = fs.readFile(LEVEL_CACHE_PATH, 'utf8')
-      .then(JSON.parse)
-      .catch(() => ({}));
-  }
-  return levelCachePromise;
-}
-
-async function saveLevelCache() {
-  const cache = await getLevelCache();
-  await fs.mkdir(__dirname + 'data', { recursive: true });
-  await fs.writeFile(LEVEL_CACHE_PATH, JSON.stringify(cache, null, 1), 'utf8');
-}
-
-// Merge freshly observed daily values into the cache under `key` and return
-// the combined series. Fresh values win; only the newest LEVEL_CACHE_KEEP_DAYS
-// are kept.
+// ── Level/flow observation archive ──
 //
-// The cap used to be 400, which quietly discarded most of what had already been
-// paid for: fetchStationData pulls five years of daily means every run, and all
-// but the newest 400 days were thrown away. It also left every station showing
-// a bogus interior gap — an old head block, then a jump of 158-523 days to the
-// recent tail — because the cap trimmed from a series whose middle had never
-// been fetched. Keeping ~5.5 years captures what the API already returns, and
-// the gaps backfill themselves on the next run.
-const LEVEL_CACHE_KEEP_DAYS = 2000;
+// The realtime API keeps only ~1 month and the daily-mean series lags, so
+// observations are archived in the repo. One append-only CSV per series, like
+// water-temp.csv: a day's run adds a line or two, which git stores as a tiny
+// delta. The previous design — every series in one JSON blob, trimmed to the
+// newest 400 days — rewrote the whole file daily AND threw away most of what
+// had already been fetched, since fetchStationData pulls years of daily means
+// on every run.
+//
+// Nothing is capped now. HYDAT holds each gauge's full period of record, and
+// the deep history is fetched once (see backfill below) rather than every run.
 
-function mergeWithLevelCache(cache, key, days) {
-  const entry = cache[key] || {};
-  for (const d of days) entry[d.date] = Math.round(d.value * 10000) / 10000;
-  const keep = Object.keys(entry).sort().slice(-LEVEL_CACHE_KEEP_DAYS);
-  cache[key] = Object.fromEntries(keep.map(k => [k, entry[k]]));
-  return keep.map(date => ({ date, value: cache[key][date] }));
+const ARCHIVE_DIR = __dirname + 'data/history/';
+const ARCHIVE_MANIFEST = ARCHIVE_DIR + '_manifest.json';
+const LEGACY_LEVEL_CACHE = __dirname + 'data/level-history.json';
+// Earlier than any Canadian hydrometric record, so the API returns the
+// station's true start rather than a window we guessed.
+const ARCHIVE_FETCH_START = '1900-01-01';
+// A full-record fetch is many paginated requests. Normal runs backfill at most
+// this many series so the morning job stays inside its timeout; the rest catch
+// up over following days. `--backfill` does them all at once.
+const BACKFILL_SERIES_PER_RUN = 2;
+
+const archiveKeyToFile = (key) => ARCHIVE_DIR + key.replace(':', '-') + '.csv';
+
+export function mergeSeries(existing, fresh) {
+  const m = new Map(existing.map(d => [d.date, d.value]));
+  for (const d of fresh) {
+    if (d && d.date && Number.isFinite(d.value)) m.set(d.date, Math.round(d.value * 10000) / 10000);
+  }
+  return [...m.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([date, value]) => ({ date, value }));
+}
+
+function parseSeriesCsv(text) {
+  return text.trim().split('\n').slice(1).map(line => {
+    const [date, v] = line.split(',');
+    return { date, value: parseFloat(v) };
+  }).filter(d => d.date && Number.isFinite(d.value));
+}
+
+async function loadArchive(key) {
+  try {
+    return parseSeriesCsv(await fs.readFile(archiveKeyToFile(key), 'utf8'));
+  } catch {
+    // First run after the format change: seed from the old JSON blob so the
+    // days already collected aren't lost before the backfill lands.
+    try {
+      const legacy = JSON.parse(await fs.readFile(LEGACY_LEVEL_CACHE, 'utf8'));
+      const entry = legacy[key];
+      if (!entry) return [];
+      return Object.entries(entry)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([date, value]) => ({ date, value }));
+    } catch {
+      return [];
+    }
+  }
+}
+
+async function saveArchive(key, days) {
+  await fs.mkdir(ARCHIVE_DIR, { recursive: true });
+  const rows = days.map(d => `${d.date},${d.value}`);
+  await fs.writeFile(archiveKeyToFile(key), 'date,value\n' + rows.join('\n') + '\n', 'utf8');
+}
+
+let manifestPromise = null;
+function getManifest() {
+  if (!manifestPromise) {
+    manifestPromise = fs.readFile(ARCHIVE_MANIFEST, 'utf8').then(JSON.parse).catch(() => ({}));
+  }
+  return manifestPromise;
+}
+
+async function saveManifest() {
+  const m = await getManifest();
+  await fs.mkdir(ARCHIVE_DIR, { recursive: true });
+  await fs.writeFile(ARCHIVE_MANIFEST, JSON.stringify(m, null, 1), 'utf8');
+}
+
+// A full record can be many decades of dailies. Pages are 500 (the size the
+// API has served reliably for this project); 400 of them is 200,000 rows, far
+// past any station's record, so this bounds runaway paging without truncating.
+const DEEP_FETCH_MAX_PAGES = 400;
+
+// Fold fresh observations into a series' archive and persist it. `deep` marks
+// the series as backfilled so the expensive full-record request happens once.
+async function archiveMerge(key, fresh, deep) {
+  const merged = mergeSeries(await loadArchive(key), fresh);
+  await saveArchive(key, merged);
+  if (deep && merged.length > 0) {
+    const m = await getManifest();
+    m[key] = { backfilled: true, firstDate: merged[0].date, lastDate: merged[merged.length - 1].date, n: merged.length };
+  }
+  return merged;
+}
+
+// How many series still need their one-time deep fetch, and whether this run
+// is allowed to take another one.
+let backfillTakenThisRun = 0;
+async function claimBackfillSlot(key) {
+  const m = await getManifest();
+  if (m[key]?.backfilled) return false;
+  if (process.argv.includes('--backfill')) return true;
+  if (backfillTakenThisRun >= BACKFILL_SERIES_PER_RUN) return false;
+  backfillTakenThisRun++;
+  return true;
+}
+
+// Read every archived series at once — used by the site generator, which never
+// touches the network.
+export async function loadAllArchives() {
+  const out = {};
+  let names = [];
+  try {
+    names = (await fs.readdir(ARCHIVE_DIR)).filter(n => n.endsWith('.csv'));
+  } catch { /* no archive yet */ }
+  for (const name of names) {
+    const key = name.replace('.csv', '').replace('-', ':');
+    out[key] = parseSeriesCsv(await fs.readFile(ARCHIVE_DIR + name, 'utf8'));
+  }
+  if (Object.keys(out).length > 0) return out;
+  // Pre-migration fallback so the site still builds from the old blob.
+  try {
+    const legacy = JSON.parse(await fs.readFile(LEGACY_LEVEL_CACHE, 'utf8'));
+    for (const [key, entry] of Object.entries(legacy)) {
+      out[key] = Object.entries(entry)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([date, value]) => ({ date, value }));
+    }
+  } catch { /* nothing to fall back to */ }
+  return out;
 }
 
 function parseERDDAPCsv(text) {
@@ -1272,28 +1364,41 @@ async function fetchStationData(stationId) {
     console.log(`    Realtime failed: ${e.message}`);
   }
 
-  // 2. Daily-mean history (5+ years). Authoritative daily values; lags realtime
-  //    by a few days so we backfill with realtime below for any missing recent dates.
+  // 2. Daily-mean history — the authoritative daily values, lagging realtime by
+  //    a few days (realtime fills the tail below). Once per series we ask for
+  //    the whole period of record; after that a 5-year window is plenty, since
+  //    everything older is already archived.
+  const key = `level:${stationId}`;
+  result.deepFetch = await claimBackfillSlot(key);
+  const from = result.deepFetch ? ARCHIVE_FETCH_START : HISTORY_START;
   try {
     const feats = await fetchAllFeatures(
-      (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${stationId}&datetime=${HISTORY_START}/${HISTORY_END}&limit=${lim}&offset=${off}`,
-      20
+      (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${stationId}&datetime=${from}/${HISTORY_END}&limit=${lim}&offset=${off}`,
+      result.deepFetch ? DEEP_FETCH_MAX_PAGES : 20
     );
     result.history = parseDaily(feats, 'LEVEL');
+    if (result.deepFetch) {
+      console.log(`    full record: ${result.history.length} daily means` +
+        (result.history.length ? ` from ${result.history[0].date}` : ''));
+    }
   } catch (e) {
     console.log(`    Daily-mean history failed: ${e.message}`);
+    result.deepFetch = false;
   }
 
   // 3. Combine history + realtime (realtime fills dates daily-mean hasn't
-  //    published yet), then merge with the on-disk cache of past observations.
+  //    published yet), then fold into the on-disk archive.
   const histDates = new Set(result.history.map(d => d.date));
   const rtFill = result.realtimeDaily.filter(d => !histDates.has(d.date));
   const combined = [...result.history, ...rtFill].sort((a, b) => a.date.localeCompare(b.date));
-  result.recentDays = mergeWithLevelCache(await getLevelCache(), `level:${stationId}`, combined);
+  result.recentDays = await archiveMerge(key, combined, result.deepFetch);
 
-  // 4. July averages — all July days across the 5-year history.
-  const julyVals = result.history
-    .filter(d => d.date.substring(5, 7) === '07')
+  // 4. July average — deliberately the last 5 Julys, not every July in the
+  //    archive. The email and site both call this "the five-year July average";
+  //    now that the archive can run to decades, averaging all of it would
+  //    silently redefine every "vs July avg" number on both surfaces.
+  const julyVals = result.recentDays
+    .filter(d => d.date >= HISTORY_START && d.date.substring(5, 7) === '07')
     .map(d => d.value);
   if (julyVals.length > 0) {
     result.julyAvg = julyVals.reduce((a, b) => a + b, 0) / julyVals.length;
@@ -1329,18 +1434,26 @@ async function fetchFlowData(stationId) {
     console.log(`    Realtime flow failed: ${e.message}`);
   }
 
-  // Daily-mean discharge history — use full history window (same as water levels)
-  // so we catch data even if the discharge rating curve lags months behind.
+  // Daily-mean discharge history. Same one-time deep fetch as levels: the
+  // rating curve can lag months, and HYDAT holds the gauge's whole record.
+  const key = `flow:${stationId}`;
+  result.deepFetch = await claimBackfillSlot(key);
+  const from = result.deepFetch ? ARCHIVE_FETCH_START : HISTORY_START;
   try {
     const feats = await fetchAllFeatures(
-      (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${stationId}&datetime=${HISTORY_START}/${HISTORY_END}&limit=${lim}&offset=${off}`,
-      20
+      (lim, off) => `${API_BASE}/hydrometric-daily-mean/items?f=json&STATION_NUMBER=${stationId}&datetime=${from}/${HISTORY_END}&limit=${lim}&offset=${off}`,
+      result.deepFetch ? DEEP_FETCH_MAX_PAGES : 20
     );
     const withDischarge = feats.filter(f => f.properties?.DISCHARGE != null).length;
     console.log(`    daily-mean: ${feats.length} features, ${withDischarge} with DISCHARGE`);
     result.history = parseDaily(feats, 'DISCHARGE');
+    if (result.deepFetch) {
+      console.log(`    full record: ${result.history.length} daily means` +
+        (result.history.length ? ` from ${result.history[0].date}` : ''));
+    }
   } catch (e) {
     console.log(`    Daily-mean flow failed: ${e.message}`);
+    result.deepFetch = false;
   }
 
   // Combine: history + realtime fill for dates history hasn't published yet,
@@ -1348,7 +1461,7 @@ async function fetchFlowData(stationId) {
   const histDates = new Set(result.history.map(d => d.date));
   const rtFill = result.realtimeDaily.filter(d => !histDates.has(d.date));
   const combined = [...result.history, ...rtFill].sort((a, b) => a.date.localeCompare(b.date));
-  result.recentDays = mergeWithLevelCache(await getLevelCache(), `flow:${stationId}`, combined);
+  result.recentDays = await archiveMerge(key, combined, result.deepFetch);
 
   return result;
 }
@@ -1530,8 +1643,8 @@ async function main() {
 
   // All station/flow fetches are done — persist the observation cache so the
   // workflow's data-commit step picks it up
-  await saveLevelCache();
-  console.log('  Level/flow observation cache saved');
+  await saveManifest();
+  console.log('  Level/flow archive saved');
 
   // 8. Dump diagnostic CSV with all computed values
   {
@@ -1893,10 +2006,10 @@ export {
   buildWaterLevelChart, buildFlowChart, buildSpreadChart,
   // pure helpers, exported for scripts/test.mjs
   filterOutliers, readingNDaysBack, median, poolAroundDay, addDays, toRecord,
-  lastCalendarDays, mergeWithLevelCache, parseMurAscii,
+  lastCalendarDays, parseMurAscii,
   computeTodayTempStats, computeNextWeekTempForecast,
   daysBetween, ordinal, paddedBounds,
   // station tables, so the site generator labels gauges identically to the email
   STATION, EXTRA_STATIONS, FLOW_STATIONS, CM_PER_INCH, TODAY_ISO, CURRENT_YEAR,
-  TEMP_CSV_PATH, LEVEL_CACHE_PATH,
+  TEMP_CSV_PATH, ARCHIVE_DIR,
 };

@@ -7,9 +7,9 @@
 import fs from 'node:fs/promises';
 import {
   median, poolAroundDay, toRecord, addDays, daysBetween, readingNDaysBack,
-  computeTodayTempStats, computeNextWeekTempForecast,
+  computeTodayTempStats, computeNextWeekTempForecast, loadAllArchives,
   STATION, EXTRA_STATIONS, FLOW_STATIONS, CM_PER_INCH,
-  TEMP_CSV_PATH, LEVEL_CACHE_PATH,
+  TEMP_CSV_PATH,
 } from '../../notify.mjs';
 
 export const LEVEL_STATIONS = [
@@ -28,13 +28,11 @@ export async function loadTemps() {
 }
 
 export async function loadLevelCache() {
-  return JSON.parse(await fs.readFile(LEVEL_CACHE_PATH, 'utf8'));
+  return loadAllArchives();
 }
 
 export function seriesFrom(cache, key) {
-  return Object.entries(cache[key] ?? {})
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([date, value]) => ({ date, value }));
+  return cache[key] ?? [];
 }
 
 // ── shared stats ──
@@ -194,47 +192,82 @@ export function buildAllYearsPayload(records, currentYear) {
 
 // ── levels and flow ──
 
-function julyAverage(days) {
-  const july = days.filter(d => d.date.substring(5, 7) === '07').map(d => d.value);
+// The "vs July avg" figure both surfaces quote is explicitly a FIVE-year
+// average. The archive now runs to decades, so this has to be windowed —
+// averaging every July on record would silently redefine the headline number
+// on the email and every card on the site.
+const JULY_AVG_YEARS = 5;
+
+function julyAverage(days, currentYear) {
+  const cutoff = `${currentYear - JULY_AVG_YEARS}-01-01`;
+  const july = days
+    .filter(d => d.date >= cutoff && d.date.substring(5, 7) === '07')
+    .map(d => d.value);
   if (july.length === 0) return null;
   return july.reduce((a, b) => a + b, 0) / july.length;
 }
 
-function stationBlock(st, days, { unit, format, decimals }) {
+// Monthly means over the whole record. Decades of dailies would be several MB;
+// this is ~12 rows a year, so the deep history ships in a few KB and the daily
+// resolution is reserved for the recent years anyone actually scrubs through.
+// Dated to mid-month so the browser can plot it with the same code path.
+function monthlyMeans(days) {
+  const buckets = new Map();
+  for (const d of days) {
+    const ym = d.date.substring(0, 7);
+    if (!buckets.has(ym)) buckets.set(ym, []);
+    buckets.get(ym).push(d.value);
+  }
+  return [...buckets.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([ym, vals]) => [
+    `${ym}-15`,
+    r3(vals.reduce((a, b) => a + b, 0) / vals.length),
+    r3(Math.min(...vals)), r3(Math.max(...vals)), vals.length,
+  ]);
+}
+
+const DAILY_YEARS = 2; // full-resolution window shipped to the browser
+
+function stationBlock(st, days, { unit, format, decimals }, currentYear) {
   const latest = days[days.length - 1];
   const values = days.map(d => d.value);
-  const avg = julyAverage(days);
+  const avg = julyAverage(days, currentYear);
   const back = (n) => {
     const p = readingNDaysBack(days, n, 2);
     return p ? { date: p.date, change: (latest.value - p.value) } : null;
   };
+  const dailyFrom = addDays(latest.date, -Math.round(DAILY_YEARS * 365.25));
   return {
     id: st.id, name: st.name, label: st.label, unit, format, decimals,
     latest: { date: latest.date, value: r3(latest.value) },
-    julyAvg: r3(avg),
+    julyAvg: r3(avg), julyAvgYears: JULY_AVG_YEARS,
     // Inches relative to the station's own July mean. The five level gauges sit
     // on different datums (Bala is ~225 m above sea level, the rest are 0-10 m
     // local), so this is the ONLY quantity comparable across stations.
     vsJulyIn: avg === null ? null : r1((latest.value - avg) * 100 / CM_PER_INCH),
     trailing: { d7: r3(trailingMean(days, 7)), d30: r3(trailingMean(days, 30)) },
     changes: { d1: back(1), d7: back(7), d30: back(30) },
+    // Distribution and percentile span the ENTIRE record, so "52nd percentile"
+    // means against every reading ever taken at the gauge, not a 400-day window.
     dist: Object.fromEntries(Object.entries(distribution(values)).map(([k, v]) => [k, k === 'n' ? v : r3(v)])),
     percentile: percentileOf(values, latest.value),
     firstDate: days[0].date, lastDate: latest.date, n: days.length,
-    series: days.map(d => [d.date, r3(d.value)]),
+    years: Math.max(1, Math.round((new Date(latest.date) - new Date(days[0].date)) / 31557600000)),
+    series: days.filter(d => d.date >= dailyFrom).map(d => [d.date, r3(d.value)]),
+    monthly: monthlyMeans(days),
   };
 }
 
 export function buildLevelsPayload(cache, todayIso) {
+  const currentYear = parseInt(todayIso.substring(0, 4), 10);
   const stations = [];
   for (const st of LEVEL_STATIONS) {
     const days = seriesFrom(cache, `level:${st.id}`);
     if (days.length === 0) continue;
-    stations.push(stationBlock(st, days, { unit: 'm', format: 'f3', decimals: 3 }));
+    stations.push(stationBlock(st, days, { unit: 'm', format: 'f3', decimals: 3 }, currentYear));
   }
   // Normalised comparison: inches from each station's own July mean, on the
   // dates every station has in common.
-  const withAvg = stations.filter(s => s.julyAvg !== null);
+  const withAvg = stations.filter(s => s.julyAvg !== null && s.series.length > 0);
   const maps = withAvg.map(s => new Map(s.series));
   const commonDates = withAvg.length === 0 ? [] :
     [...maps[0].keys()].filter(d => maps.every(m => m.has(d))).sort();
@@ -249,6 +282,7 @@ export function buildLevelsPayload(cache, todayIso) {
 }
 
 export function buildFlowPayload(cache, todayIso) {
+  const currentYear = parseInt(todayIso.substring(0, 4), 10);
   const stations = [];
   const omitted = [];
   for (const st of FLOW_STATIONS) {
@@ -261,7 +295,7 @@ export function buildFlowPayload(cache, todayIso) {
       if (days.length > 0) omitted.push({ id: st.id, name: st.name, lastDate: days[days.length - 1].date });
       continue;
     }
-    stations.push(stationBlock(st, days, { unit: 'm³/s', format: 'f1', decimals: 1 }));
+    stations.push(stationBlock(st, days, { unit: 'm³/s', format: 'f1', decimals: 1 }, currentYear));
   }
   return { meta: { generated: todayIso, unit: 'm³/s' }, stations, omitted };
 }

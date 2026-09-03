@@ -136,6 +136,10 @@ node notify.mjs --dry-run
 # Update data/water-temp.csv only (useful for seeding history from an IP that
 # the NOAA ERDDAP mirrors haven't blocked — GitHub runner IPs often are).
 node notify.mjs --fetch-only
+
+# Fetch every gauge's FULL period of record from HYDAT in one go, rather than
+# letting the daily job pick up two series at a time.
+node notify.mjs --backfill
 ```
 
 > **Note:** the daily cron always runs the **default branch** (`main`). Changes
@@ -153,6 +157,19 @@ node notify.mjs --fetch-only
 **Change the station:** Edit `notify.mjs` and change the `STATION` constant. Find station IDs at [wateroffice.ec.gc.ca](https://wateroffice.ec.gc.ca/search/real_time_e.html).
 
 ---
+
+## Data
+
+`data/history/` holds one append-only CSV per gauge series, covering each
+station's full period of record from HYDAT. A daily run adds a line or two per
+file, so git stores it as a small delta rather than rewriting a blob.
+
+The deep history is fetched **once** per series and recorded in
+`data/history/_manifest.json`. Ordinary runs then request only a five-year
+window, since everything older is already archived; `--backfill` does every
+series at once. Note that "vs July avg" stays a deliberate **five-year**
+average even though the archive runs much deeper — widening it would silently
+redefine the headline number on both the email and the site.
 
 ## Data source
 

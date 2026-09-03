@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict';
 import {
   filterOutliers, readingNDaysBack, median, poolAroundDay, addDays, toRecord,
-  mergeWithLevelCache, parseMurAscii, computeNextWeekTempForecast,
+  mergeSeries, parseMurAscii, computeNextWeekTempForecast,
 } from '../notify.mjs';
 import {
   quantile, distribution, percentileOf, climatology, windowByDate,
@@ -95,16 +95,33 @@ test('poolAroundDay excludes the given year', () => {
   assert.deepEqual(pool.map(r => r.tempC), [1]);
 });
 
-// ── mergeWithLevelCache ──
+// ── mergeSeries ──
 
-test('fresh values overwrite, cache is capped, series comes back sorted', () => {
-  const cache = { 'level:X': { '2026-08-01': 1.0 } };
-  const merged = mergeWithLevelCache(cache, 'level:X', [
-    { date: '2026-08-01', value: 2.0 }, { date: '2026-07-31', value: 0.5 },
-  ]);
+test('fresh values overwrite and the series comes back sorted', () => {
+  const merged = mergeSeries(
+    [{ date: '2026-08-01', value: 1.0 }],
+    [{ date: '2026-08-01', value: 2.0 }, { date: '2026-07-31', value: 0.5 }],
+  );
   assert.deepEqual(merged, [
     { date: '2026-07-31', value: 0.5 }, { date: '2026-08-01', value: 2.0 },
   ]);
+});
+
+test('merge keeps the whole record — nothing is capped', () => {
+  // The old cache trimmed to the newest 400 days, silently discarding decades
+  // of archive on every write.
+  const long = Array.from({ length: 5000 }, (_, i) => ({ date: addDays('1960-01-01', i), value: i }));
+  const merged = mergeSeries(long, [{ date: '2026-09-02', value: 9 }]);
+  assert.equal(merged.length, 5001);
+  assert.equal(merged[0].date, '1960-01-01');
+});
+
+test('merge drops malformed rows rather than poisoning the archive', () => {
+  const merged = mergeSeries([], [
+    { date: '2026-08-01', value: 1 }, { date: '2026-08-02', value: NaN },
+    { date: null, value: 3 }, { date: '2026-08-03', value: 2 },
+  ]);
+  assert.deepEqual(merged.map(d => d.date), ['2026-08-01', '2026-08-03']);
 });
 
 // ── parseMurAscii unit handling ──
