@@ -1,1 +1,14 @@
-{}
+{
+ "level:02EB015": {
+  "backfilled": true,
+  "firstDate": "2003-01-01",
+  "lastDate": "2026-09-03",
+  "n": 8461
+ },
+ "level:02EB018": {
+  "backfilled": true,
+  "firstDate": "2002-11-01",
+  "lastDate": "2026-09-03",
+  "n": 8142
+ }
+}
