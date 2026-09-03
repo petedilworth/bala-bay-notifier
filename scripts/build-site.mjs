@@ -1,4 +1,4 @@
-// Static-site generator for the Bala Bay dashboard.
+// Static-site generator for the Muskoka Tracker dashboard.
 //
 //   node scripts/build-site.mjs        (or: npm run build:site)
 //
@@ -51,8 +51,8 @@ function page({ file, title, heading, sub, body, script }) {
 <header class="site">
   <div class="wrap">
     <div class="brand">
-      <h1>🌊 Bala Bay</h1>
-      <span class="sub">Lake Muskoka water conditions</span>
+      <h1>🌊 Muskoka Tracker</h1>
+      <span class="sub">Lake Muskoka &amp; Rosseau water conditions</span>
     </div>
     <nav class="site">
       ${NAV.map(([href, label]) =>
@@ -182,14 +182,14 @@ function indexPage(o, temp) {
   </div>`;
 
   const script = `
-Bala.getJSON('data/overview.json').then(function (o) {
+Muskoka.getJSON('data/overview.json').then(function (o) {
   if (!o.level) return;
   var st = { name: o.level.name, unit: 'm', format: 'f3', decimals: 3, series: o.level.series };
-  Bala.charts.datedSeries(document.getElementById('ch-level'), st, 90, ${lvl && lvl.vsJulyIn !== null ? `${(lvl.value - lvl.vsJulyIn * 2.54 / 100).toFixed(4)}` : 'null'});
+  Muskoka.charts.datedSeries(document.getElementById('ch-level'), st, 90, ${lvl && lvl.vsJulyIn !== null ? `${(lvl.value - lvl.vsJulyIn * 2.54 / 100).toFixed(4)}` : 'null'});
 });`;
 
   return page({
-    file: 'index.html', title: 'Bala Bay — today',
+    file: 'index.html', title: 'Muskoka Tracker — today',
     heading: 'Today on the lake',
     sub: `Level, temperature and flow as of the most recent reading from each source.`,
     body, script,
@@ -279,25 +279,25 @@ function draw(mode) {
   var el = document.getElementById('ch-clim');
   if (mode === 'all') {
     if (!allYears) {
-      Bala.getJSON('data/temperature-allyears.json').then(function (d) { allYears = d; draw('all'); });
+      Muskoka.getJSON('data/temperature-allyears.json').then(function (d) { allYears = d; draw('all'); });
       return;
     }
-    chart = Bala.charts.tempAllYears(el, allYears);
+    chart = Muskoka.charts.tempAllYears(el, allYears);
   } else if (mode === 'year') {
-    chart = Bala.charts.tempClimatology(el, T, { xMin: 1, xMax: 366 });
+    chart = Muskoka.charts.tempClimatology(el, T, { xMin: 1, xMax: 366 });
   } else {
-    chart = Bala.charts.tempClimatology(el, T, {
+    chart = Muskoka.charts.tempClimatology(el, T, {
       xMin: Math.max(1, T.latest.dayOfYear - 120), xMax: Math.min(366, T.latest.dayOfYear + 20)
     });
   }
 }
 draw('season');
-Bala.toggleGroup(document.getElementById('ch-clim-toggles'), draw);
-Bala.charts.tempAnomaly(document.getElementById('ch-anom'), T);
-Bala.renderDist(document.getElementById('dist-temp'), ${JSON.stringify(t.dist)}, ${t.latest.value}, 'f1', '°C');`;
+Muskoka.toggleGroup(document.getElementById('ch-clim-toggles'), draw);
+Muskoka.charts.tempAnomaly(document.getElementById('ch-anom'), T);
+Muskoka.renderDist(document.getElementById('dist-temp'), ${JSON.stringify(t.dist)}, ${t.latest.value}, 'f1', '°C');`;
 
   return page({
-    file: 'temperature.html', title: 'Bala Bay — water temperature',
+    file: 'temperature.html', title: 'Muskoka Tracker — water temperature',
     heading: 'Water temperature',
     sub: `${t.meta.records.toLocaleString('en-CA')} daily satellite readings, ${escDate(t.meta.firstDate)} to ${escDate(t.meta.lastDate)}.`,
     body, script,
@@ -344,26 +344,26 @@ function stationPage({ file, title, heading, sub, payload, comparison, note }) {
   </div>` : '';
 
   const script = `
-Bala.getJSON('data/${file.replace('.html', '')}.json').then(function (d) {
+Muskoka.getJSON('data/${file.replace('.html', '')}.json').then(function (d) {
   d.stations.forEach(function (st) {
     var chart = null;
     function draw(days) {
       if (chart) chart.destroy();
-      chart = Bala.charts.datedSeries(document.getElementById('ch-' + st.id), st, parseInt(days, 10), st.julyAvg);
+      chart = Muskoka.charts.datedSeries(document.getElementById('ch-' + st.id), st, parseInt(days, 10), st.julyAvg);
     }
     draw(90);
-    Bala.toggleGroup(document.getElementById('ch-' + st.id + '-toggles'), draw);
-    Bala.renderDist(document.getElementById('dist-' + st.id), st.dist, st.latest.value, st.format, st.unit);
+    Muskoka.toggleGroup(document.getElementById('ch-' + st.id + '-toggles'), draw);
+    Muskoka.renderDist(document.getElementById('dist-' + st.id), st.dist, st.latest.value, st.format, st.unit);
   });
   ${comparison ? `
   if (d.comparison && d.comparison.series.length) {
     var c = null;
     function drawCmp(days) {
       if (c) c.destroy();
-      c = Bala.charts.comparison(document.getElementById('ch-cmp'), d.comparison, parseInt(days, 10));
+      c = Muskoka.charts.comparison(document.getElementById('ch-cmp'), d.comparison, parseInt(days, 10));
     }
     drawCmp(90);
-    Bala.toggleGroup(document.getElementById('ch-cmp-toggles'), drawCmp);
+    Muskoka.toggleGroup(document.getElementById('ch-cmp-toggles'), drawCmp);
   }` : ''}
 });`;
 
@@ -414,7 +414,7 @@ function aboutPage(temp, levels, flow) {
   </div>`;
 
   return page({
-    file: 'about.html', title: 'Bala Bay — about the data',
+    file: 'about.html', title: 'Muskoka Tracker — about the data',
     heading: 'About the data', sub: 'Sources, update cadence, and what the numbers mean.',
     body, script: '',
   });
@@ -459,13 +459,13 @@ async function main() {
     'index.html': indexPage(overview, temp),
     'temperature.html': temperaturePage(temp),
     'levels.html': stationPage({
-      file: 'levels.html', title: 'Bala Bay — water levels',
+      file: 'levels.html', title: 'Muskoka Tracker — water levels',
       heading: 'Water levels', sub: 'Five gauges around Lake Muskoka and Lake Rosseau.',
       payload: levels, comparison: true,
       note: staleNotice(overview.level ? overview.level.ageDays : null, 'gauge', 2),
     }),
     'flow.html': stationPage({
-      file: 'flow.html', title: 'Bala Bay — river flow',
+      file: 'flow.html', title: 'Muskoka Tracker — river flow',
       heading: 'River flow', sub: 'Discharge on the Muskoka and Indian rivers.',
       payload: flow, comparison: false, note: '',
     }),
@@ -486,7 +486,7 @@ async function main() {
 
   await fs.writeFile(DOCS + 'robots.txt', 'User-agent: *\nDisallow: /\n', 'utf8');
   await fs.writeFile(DOCS + '404.html', page({
-    file: '', title: 'Bala Bay — not found', heading: 'Not found',
+    file: '', title: 'Muskoka Tracker — not found', heading: 'Not found',
     sub: 'That page does not exist.',
     body: '<div class="card"><p class="lede"><a href="index.html">Back to today’s conditions</a></p></div>',
     script: '',

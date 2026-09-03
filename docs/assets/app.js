@@ -1,4 +1,4 @@
-/* Bala Bay dashboard — dumb renderer.
+/* Muskoka Tracker dashboard — dumb renderer.
    All shaping happens in scripts/build-site.mjs. This file formats numbers and
    draws charts; it computes nothing the generator could have computed. */
 (function () {
@@ -358,7 +358,7 @@
     });
   }
 
-  window.Bala = {
+  window.Muskoka = {
     fmt: fmt, ordinal: ordinal, shortDate: shortDate, longDate: longDate,
     dayOfYearLabel: dayOfYearLabel, renderDist: renderDist,
     charts: {

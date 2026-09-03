@@ -1,4 +1,4 @@
-name: Daily Bala Bay Water Level
+name: Daily Muskoka Water Levels
 
 on:
   schedule:

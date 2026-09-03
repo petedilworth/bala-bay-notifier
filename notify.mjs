@@ -7,7 +7,7 @@ const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const TEMP_CSV_PATH = __dirname + 'data/water-temp.csv';
 
 /**
- * Bala Bay Daily Water Level Notification
+ * Muskoka Tracker — Daily Water Level Notification
  *
  * Fetches the latest water level from Environment Canada's OGC API
  * and water temperature from NOAA MUR SST satellite data,
@@ -93,7 +93,9 @@ const OUTLIER_THRESHOLD_M = 0.5;
 // ── Configuration (from environment variables) ──
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const EMAIL_TO = (process.env.EMAIL_TO || '').split(',').map(e => e.trim()).filter(Boolean);
-const EMAIL_FROM = process.env.EMAIL_FROM || 'Bala Bay <onboarding@resend.dev>';
+// Display name only matters locally: in CI the From line comes from the
+// EMAIL_FROM secret, so renaming the sender there is a separate step.
+const EMAIL_FROM = process.env.EMAIL_FROM || 'Muskoka Tracker <onboarding@resend.dev>';
 
 // ── Fetch helpers ──
 
@@ -689,7 +691,7 @@ async function buildTempSpaghettiChart(records, waterTemp) {
       plugins: {
         title: {
           display: true,
-          text: 'Bala Bay Water Temperature — Year over Year',
+          text: 'Water Temperature — Bala Bay · Year over Year',
           font: { size: 13, weight: '600', family: 'sans-serif' },
           color: '#0B1D33',
           padding: { bottom: 8 },
@@ -907,7 +909,7 @@ async function buildTempAnomalyChart(records) {
       plugins: {
         title: {
           display: true,
-          text: 'Bala Bay Water Temperature — Daily Anomaly vs Historical Median (YTD)',
+          text: 'Water Temperature — Bala Bay · Daily Anomaly vs Historical Median (YTD)',
           font: { size: 13, weight: '600', family: 'sans-serif' },
           color: '#0B1D33',
           padding: { bottom: 8 },
@@ -1354,7 +1356,7 @@ async function fetchFlowData(stationId) {
 // ── Main ──
 
 async function main() {
-  console.log('🌊 Bala Bay Daily Water Level Notification');
+  console.log('🌊 Muskoka Tracker — Daily Water Level Notification');
   console.log('──────────────────────────────────────────');
 
   // Fetch-only mode: update the water temperature cache and exit (no email,
@@ -1696,7 +1698,7 @@ async function main() {
 
     <!-- Header -->
     <div style="margin-bottom:20px;">
-      <h1 style="margin:0;font-size:20px;color:#0B1D33;">🌊 Bala Bay</h1>
+      <h1 style="margin:0;font-size:20px;color:#0B1D33;">🌊 Muskoka Tracker</h1>
       <p style="margin:4px 0 0;font-size:13px;color:#6B6B6B;">${dateStr}</p>
       ${staleLevelNote ? `<p style="margin:6px 0 0;font-size:11px;color:#C0392B;">⚠ ${staleLevelNote}</p>` : ''}
     </div>
@@ -1793,7 +1795,7 @@ async function main() {
       return `  ${s.name} (${s.label}): ${lat.value.toFixed(1)} m³/s (${fmtShort(lat)})`;
     }).join('\n');
   const text = [
-    `🌊 Bala Bay Water Level — ${dateStr}`,
+    `🌊 Muskoka Water Levels — ${dateStr}`,
     staleLevelNote ? `⚠ ${staleLevelNote}` : '',
     ``,
     `Current: ${deltaSign}${deltaIn?.toFixed(1) ?? '?'} in vs July avg`,
@@ -1858,7 +1860,7 @@ async function main() {
     body: JSON.stringify({
       from: EMAIL_FROM,
       to: EMAIL_TO,
-      subject: `🌊 Bala Bay: ${deltaSign}${deltaIn?.toFixed(1) ?? '?'} in vs July avg${waterTemp ? ` · ${waterTemp.tempC.toFixed(1)}°C` : ''}`,
+      subject: `🌊 Muskoka: ${deltaSign}${deltaIn?.toFixed(1) ?? '?'} in vs July avg${waterTemp ? ` · ${waterTemp.tempC.toFixed(1)}°C` : ''}`,
       html: html,
       text: text,
       ...(attachments.length > 0 ? { attachments } : {}),

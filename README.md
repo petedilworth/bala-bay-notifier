@@ -1,13 +1,22 @@
-# 🌊 Bala Bay Water Level — Daily Email Notification
+# 🌊 Muskoka Tracker
 
-Sends a daily email with the current water level at Bala Bay (Lake Muskoka, Station 02EB015), compared to the 5-year July average, with a 7-day trend indicator and sparkline.
+Daily water conditions for Lake Muskoka and Lake Rosseau — a morning email plus
+a static dashboard, both rebuilt automatically and hosted for free.
+
+Covers nine gauge slots: water levels at Bala, Beaumaris, Port Carling, Port
+Sydney and Baysville, and river flow on both branches of the Muskoka River and
+the Indian River. Water temperature comes from satellite, with an archive going
+back to 2002.
 
 ## How it works
 
 1. A GitHub Actions workflow runs every morning at ~7am ET
-2. It fetches the latest water level from Environment Canada's open data API
-3. It computes the delta vs the 5-year July average and the 7-day trend
-4. It sends a clean HTML email via Resend to you and your dad
+2. It fetches levels and flow from Environment Canada's open data API, and water
+   temperature from NOAA's MUR SST satellite analysis
+3. It computes deltas against the 5-year July average, the 7-day trend, and how
+   today's temperature ranks against every year on record
+4. It emails an HTML summary via Resend, rebuilds the dashboard, and commits the
+   refreshed data
 
 **Cost: $0.** GitHub Actions is free for public repos, and Resend's free tier covers 100 emails/day.
 
@@ -26,7 +35,7 @@ Sends a daily email with the current water level at Bala Bay (Lake Muskoka, Stat
 ### Step 2: Create the GitHub repo
 
 1. Go to [github.com/new](https://github.com/new)
-2. Name it something like `bala-bay-notifier`
+2. Name it something like `muskoka-tracker`
 3. Make it **Public** (required for free GitHub Actions minutes)
 4. Upload the files from this project:
    - `notify.mjs` (in the root)
@@ -43,14 +52,14 @@ In your GitHub repo:
 |---|---|---|
 | `RESEND_API_KEY` | Your Resend API key | `re_abc123...` |
 | `EMAIL_TO` | Comma-separated email addresses | `pedro@example.com,dad@example.com` |
-| `EMAIL_FROM` | Sender address (optional) | `Bala Bay <onboarding@resend.dev>` |
+| `EMAIL_FROM` | Sender address (optional) | `Muskoka Tracker <onboarding@resend.dev>` |
 
-> For `EMAIL_FROM`: if you haven't verified a custom domain in Resend, use `Bala Bay <onboarding@resend.dev>`.
+> For `EMAIL_FROM`: if you haven't verified a custom domain in Resend, use `Muskoka Tracker <onboarding@resend.dev>`.
 
 ### Step 4: Test it
 
 1. Go to **Actions** tab in your repo
-2. Click **Daily Bala Bay Water Level** on the left
+2. Click **Daily Muskoka Water Levels** on the left
 3. Click **Run workflow** → **Run workflow**
 4. Watch it run — you should get an email within a minute!
 
@@ -63,16 +72,21 @@ The workflow will now run automatically every morning. GitHub will email you if 
 ## What the email looks like
 
 ```
-🌊 Bala Bay: 224.87m (+3.2cm vs July)
+Subject: 🌊 Muskoka: -0.9 in vs July avg · 20.0°C
 
-Current Level: 224.872 m
+🌊 Muskoka Water Levels — Sunday, August 30, 2026
 
-vs 5-Year July Average: +3.2 cm
-  Slightly above normal · July avg: 224.840m
+Current: -0.9 in vs July avg
+Water temp (Aug 28): 20.0°C (68°F)
+  Aug 25-Aug 31 historically: 18.2-24.8°C (median 21.3°C) across 2002-2025
+  — ranks 22nd warmest of 25 years on record — median temp expected to
+  cool ~0.2°C over next 7 days (24-yr pattern)
 
-7-day trend: +0.8 cm ↗ rising
+7-day trend: +0.2 in ↗ rising
 
-[sparkline of last 14 days]
+[year-over-year temperature chart]
+[daily anomaly chart]
+[water level + river flow charts per station]
 ```
 
 ---
@@ -91,9 +105,21 @@ The generator does all the data shaping; `docs/assets/app.js` only formats
 numbers and draws charts. Chart.js is vendored into `docs/assets/` rather than
 loaded from a CDN, so the site works anywhere.
 
-To publish: repo **Settings → Pages → Source: deploy from branch, `main`,
-folder `/docs`**. The daily workflow rebuilds and commits `docs/` each morning.
-Pages are marked `noindex` and `robots.txt` disallows crawling.
+### Publishing it
+
+Not enabled yet. To turn it on:
+
+1. Repo **Settings → Pages**
+2. **Source:** Deploy from a branch
+3. **Branch:** `main`, folder **`/docs`** → Save
+
+It lands at **https://petedilworth.github.io/muskoka-tracker/** within a minute
+or two. The daily workflow rebuilds and commits `docs/` each morning, so the
+site refreshes itself from then on.
+
+Every asset path is relative, so the site works at any base path — renaming the
+repo again would not break it. Pages carry a `noindex` meta tag and
+`robots.txt` disallows crawling, so it stays out of search results.
 
 ---
 
