@@ -32,8 +32,8 @@
 <div class="cards"><div class="card">
       <h2>Bracebridge &middot; Muskoka River</h2>
       <div class="big num">5.9<span class="unit">m³/s</span></div>
-      <div class="asof">Sep 3, 2026 &middot; -64.0 in vs July avg</div>
-      <p class="lede">40th percentile of 1,550 readings since 2021</p>
+      <div class="asof">Sep 3, 2026 &middot; 78% of the July average</div>
+      <p class="lede">40th percentile of all 1,550 readings on record (2021–2026)</p>
       <div class="table-scroll"><table class="kv">
     <tr><th></th><th>m³/s</th></tr>
     <tr><td>1-day change</td><td class="n">+0.2</td></tr>
@@ -45,8 +45,8 @@
     <div class="card">
       <h2>Port Sydney &middot; N. Branch Muskoka R.</h2>
       <div class="big num">9.1<span class="unit">m³/s</span></div>
-      <div class="asof">Sep 3, 2026 &middot; -318.4 in vs July avg</div>
-      <p class="lede">20th percentile of 1,550 readings since 2021</p>
+      <div class="asof">Sep 3, 2026 &middot; 53% of the July average</div>
+      <p class="lede">20th percentile of all 1,550 readings on record (2021–2026)</p>
       <div class="table-scroll"><table class="kv">
     <tr><th></th><th>m³/s</th></tr>
     <tr><td>1-day change</td><td class="n">-0.2</td></tr>
@@ -58,8 +58,8 @@
     <div class="card">
       <h2>Baysville &middot; S. Branch Muskoka R.</h2>
       <div class="big num">16.6<span class="unit">m³/s</span></div>
-      <div class="asof">Sep 3, 2026 &middot; -222.3 in vs July avg</div>
-      <p class="lede">35th percentile of 1,550 readings since 2021</p>
+      <div class="asof">Sep 3, 2026 &middot; 75% of the July average</div>
+      <p class="lede">35th percentile of all 1,550 readings on record (2021–2026)</p>
       <div class="table-scroll"><table class="kv">
     <tr><th></th><th>m³/s</th></tr>
     <tr><td>1-day change</td><td class="n">+0.0</td></tr>
@@ -71,8 +71,8 @@
     <div class="card">
       <h2>Port Carling &middot; Indian River</h2>
       <div class="big num">1.8<span class="unit">m³/s</span></div>
-      <div class="asof">Sep 3, 2026 &middot; -498.1 in vs July avg</div>
-      <p class="lede">39th percentile of 1,550 readings since 2021</p>
+      <div class="asof">Sep 3, 2026 &middot; 12% of the July average</div>
+      <p class="lede">39th percentile of all 1,550 readings on record (2021–2026)</p>
       <div class="table-scroll"><table class="kv">
     <tr><th></th><th>m³/s</th></tr>
     <tr><td>1-day change</td><td class="n">-0.1</td></tr>
@@ -125,6 +125,24 @@
     <div class="chart-box"><canvas id="ch-02EB011"></canvas></div>
     <div class="legend"><span class="swatch " style="background:#2D6A9F"></span>Daily <span class="swatch dot" style="background:#E07B4C"></span>Latest <span class="swatch " style="background:#5BA88A"></span>July avg (5-yr) &middot; the "All" view is monthly means</div>
   </div></div>
+  <div class="section">
+    <h2>All gauges compared</h2>
+    <div class="chart-card">
+    <div class="chart-head">
+      <div>
+        <div class="chart-title">Each gauge as a percent of its own July average</div>
+        <div class="chart-sub">The only fair comparison between these gauges — see the note below</div>
+      </div>
+      <div class="toggles" id="ch-cmp-toggles"><button type="button" data-value="90" aria-pressed="true">90 days</button><button type="button" data-value="365" aria-pressed="false">1 year</button><button type="button" data-value="730" aria-pressed="false">2 years</button></div>
+    </div>
+    <div class="chart-box"><canvas id="ch-cmp"></canvas></div>
+    <div class="legend"><span class="swatch " style="background:#2D6A9F"></span>Bracebridge <span class="swatch " style="background:#E07B4C"></span>Port Sydney <span class="swatch " style="background:#5BA88A"></span>Baysville <span class="swatch " style="background:#C0392B"></span>Port Carling</div>
+  </div>
+    <details class="explain"><summary>Why these gauges cannot share a raw axis</summary><div class="body">
+      <p>These rivers drain catchments of very different size, so plotting raw discharge together mostly ranks catchment area. Port Carling peaks near 177 m³/s while Baysville peaks near 56 — the gap between them says more about geography than about conditions.</p>
+      <code class="formula">value = flow ÷ that gauge's 5-year July mean × 100</code>
+      <p>Dividing by each gauge's own July average removes the size difference and leaves what is comparable: how hard each river is running relative to its own normal. 100% is a typical July day.</p></div></details>
+  </div>
   <footer class="site">
     Gauge data: Environment and Climate Change Canada, MSC GeoMet (station 02EB015 and neighbours).
     Water temperature: NOAA MUR SST v4.1 satellite analysis.<br>
@@ -147,6 +165,15 @@ Muskoka.getJSON('data/flow.json').then(function (d) {
     Muskoka.renderDist(document.getElementById('dist-' + st.id), st.dist, st.latest.value, st.format, st.unit);
   });
   
+  if (d.comparison && d.comparison.series.length) {
+    var c = null;
+    function drawCmp(days) {
+      if (c) c.destroy();
+      c = Muskoka.charts.comparison(document.getElementById('ch-cmp'), d.comparison, parseInt(days, 10), 'flow');
+    }
+    drawCmp(90);
+    Muskoka.toggleGroup(document.getElementById('ch-cmp-toggles'), drawCmp);
+  }
 });
 </script>
 </body>

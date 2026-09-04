@@ -107,7 +107,30 @@ function chartCard({ title, sub, id, legend, toggles, short }) {
   </div>`;
 }
 
+// Level and flow compare to their July mean differently — a difference in
+// inches for level, a ratio for flow. Sharing one formula is what produced
+// "-279.9 in vs July avg" for a discharge gauge.
+function vsJuly(st) {
+  if (st.measure === 'flow' && st.vsJulyPct !== null && st.vsJulyPct !== undefined) {
+    return ` &middot; ${st.vsJulyPct}% of the July average`;
+  }
+  if (st.vsJulyIn !== null && st.vsJulyIn !== undefined) {
+    return ` &middot; ${st.vsJulyIn > 0 ? '+' : ''}${st.vsJulyIn.toFixed(1)} in vs July avg`;
+  }
+  return '';
+}
+
 const sw = (color, cls) => `<span class="swatch ${cls || ''}" style="background:${color}"></span>`;
+
+// The charts show flat stretches broken by sudden steps, and until now the site
+// gave no reason for that shape. Lake Muskoka is a regulated lake; the steps are
+// dam operation, not weather. Saying so is worth doing on its own, whether or
+// not the OPG operations data ever gets wired in.
+const MANAGED_EXPLAINER = `<details class="explain"><summary>Why the level steps up and down so abruptly</summary><div class="body">
+      <p>Lake Muskoka is not at a natural level. It is controlled by dams at Bala — operating since 1873 — and at Port Carling, with the Ministry of Natural Resources setting stop logs under the Muskoka River Water Management Plan and its annual lake operating plans.</p>
+      <p>That is why these charts show flat stretches broken by sudden steps rather than the smooth curve rainfall alone would produce. A step usually means logs went in or came out, not that it rained. Levels are drawn down ahead of the spring melt and held through the summer.</p>
+      <p>Nothing here is adjusted for dam operation. These are the gauge readings as published.</p>
+    </div></details>`;
 
 function explain(summary, bodyHtml) {
   return `<details class="explain"><summary>${esc(summary)}</summary><div class="body">${bodyHtml}</div></details>`;
@@ -185,7 +208,7 @@ function indexPage(o, temp) {
 Muskoka.getJSON('data/overview.json').then(function (o) {
   if (!o.level) return;
   var st = { name: o.level.name, unit: 'm', format: 'f3', decimals: 3, series: o.level.series };
-  Muskoka.charts.datedSeries(document.getElementById('ch-level'), st, 90, ${lvl && lvl.vsJulyIn !== null ? `${(lvl.value - lvl.vsJulyIn * 2.54 / 100).toFixed(4)}` : 'null'});
+  Muskoka.charts.datedSeries(document.getElementById('ch-level'), st, 90, ${lvl && lvl.julyAvg !== null && lvl.julyAvg !== undefined ? lvl.julyAvg : 'null'});
 });`;
 
   return page({
@@ -304,12 +327,14 @@ Muskoka.renderDist(document.getElementById('dist-temp'), ${JSON.stringify(t.dist
   });
 }
 
-function stationPage({ file, title, heading, sub, payload, comparison, note }) {
+function stationPage({ file, title, heading, sub, payload, comparison, note, measure }) {
+  const managedNote = measure === 'level'
+    ? `\n  <div class="section">${MANAGED_EXPLAINER}</div>` : '';
   const cards = payload.stations.map(st => card(`
       <h2>${esc(st.name)} &middot; ${esc(st.label)}</h2>
       <div class="big num">${st.latest.value.toFixed(st.decimals)}<span class="unit">${esc(st.unit)}</span></div>
-      <div class="asof">${escDate(st.latest.date)}${st.vsJulyIn !== null ? ` &middot; ${st.vsJulyIn > 0 ? '+' : ''}${st.vsJulyIn.toFixed(1)} in vs July avg` : ''}</div>
-      <p class="lede">${pctLine(st.percentile, `of ${st.n.toLocaleString('en-CA')} readings since ${st.firstDate.substring(0, 4)}`)}</p>
+      <div class="asof">${escDate(st.latest.date)}${vsJuly(st)}</div>
+      <p class="lede">${pctLine(st.percentile, `of all ${st.n.toLocaleString('en-CA')} readings on record (${st.firstDate.substring(0, 4)}–${st.lastDate.substring(0, 4)})`)}</p>
       ${kvTable([
         ['1-day change', fmtChange(st.changes.d1, st.decimals)],
         ['7-day change', fmtChange(st.changes.d7, st.decimals)],
@@ -330,14 +355,20 @@ function stationPage({ file, title, heading, sub, payload, comparison, note }) {
   <div class="section">
     <h2>All gauges compared</h2>
     ${chartCard({
-      title: 'Inches above or below each gauge’s own July average',
+      title: measure === 'flow'
+        ? 'Each gauge as a percent of its own July average'
+        : 'Inches above or below each gauge’s own July average',
       sub: 'The only fair comparison between these gauges — see the note below',
       id: 'ch-cmp',
       toggles: [['90', '90 days', true], ['365', '1 year', false], ['730', '2 years', false]],
       legend: payload.comparison.stations.map((s, i) =>
         `${sw(['#2D6A9F', '#E07B4C', '#5BA88A', '#C0392B', '#7B5EA7'][i % 5])}${esc(s.name)}`).join(' '),
     })}
-    ${explain('Why these gauges cannot share a raw axis', `
+    ${measure === 'flow' ? explain('Why these gauges cannot share a raw axis', `
+      <p>These rivers drain catchments of very different size, so plotting raw discharge together mostly ranks catchment area. Port Carling peaks near 177 m³/s while Baysville peaks near 56 — the gap between them says more about geography than about conditions.</p>
+      <code class="formula">value = flow ÷ that gauge's 5-year July mean × 100</code>
+      <p>Dividing by each gauge's own July average removes the size difference and leaves what is comparable: how hard each river is running relative to its own normal. 100% is a typical July day.</p>`)
+    : explain('Why these gauges cannot share a raw axis', `
       <p>The five level gauges are surveyed to different datums. Bala reads about 225 m above sea level; the others read between 0 and 10 m on local gauge datums. Plotting them together raw would say nothing except which datum each surveyor chose.</p>
       <code class="formula">value = (level − that gauge's 5-year July mean) ÷ 2.54 cm per inch</code>
       <p>Subtracting each gauge's own July average removes the datum and leaves the part that is actually comparable: how high the water is running for the season.</p>`)}
@@ -360,7 +391,7 @@ Muskoka.getJSON('data/${file.replace('.html', '')}.json').then(function (d) {
     var c = null;
     function drawCmp(days) {
       if (c) c.destroy();
-      c = Muskoka.charts.comparison(document.getElementById('ch-cmp'), d.comparison, parseInt(days, 10));
+      c = Muskoka.charts.comparison(document.getElementById('ch-cmp'), d.comparison, parseInt(days, 10), '${measure}');
     }
     drawCmp(90);
     Muskoka.toggleGroup(document.getElementById('ch-cmp-toggles'), drawCmp);
@@ -369,7 +400,7 @@ Muskoka.getJSON('data/${file.replace('.html', '')}.json').then(function (d) {
 
   return page({
     file, title, heading, sub,
-    body: `${note}<div class="cards">${cards}</div>\n  <div class="section">${charts}</div>${cmp}`,
+    body: `${note}<div class="cards">${cards}</div>\n  <div class="section">${charts}</div>${managedNote}${cmp}`,
     script,
   });
 }
@@ -461,13 +492,13 @@ async function main() {
     'levels.html': stationPage({
       file: 'levels.html', title: 'Muskoka Tracker — water levels',
       heading: 'Water levels', sub: 'Five gauges around Lake Muskoka and Lake Rosseau.',
-      payload: levels, comparison: true,
+      payload: levels, comparison: true, measure: 'level',
       note: staleNotice(overview.level ? overview.level.ageDays : null, 'gauge', 2),
     }),
     'flow.html': stationPage({
       file: 'flow.html', title: 'Muskoka Tracker — river flow',
       heading: 'River flow', sub: 'Discharge on the Muskoka and Indian rivers.',
-      payload: flow, comparison: false, note: '',
+      payload: flow, comparison: true, measure: 'flow', note: '',
     }),
     'about.html': aboutPage(temp, levels, flow),
   };

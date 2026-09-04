@@ -13,6 +13,7 @@ import {
 } from '../notify.mjs';
 import {
   quantile, distribution, percentileOf, climatology, windowByDate,
+  buildLevelsPayload, buildFlowPayload,
 } from './lib/payloads.mjs';
 
 let passed = 0;
@@ -226,6 +227,50 @@ test('windowByDate trims by calendar date, not row count', () => {
     ['2026-08-28', '2026-08-29', '2026-08-30']);
   // and with the gap inside the window it must still exclude the old block
   assert.equal(windowByDate(rows, 400).length, 3);
+});
+
+// ── level vs flow framing ──
+// A shared stationBlock once divided m³/s by 2.54 and printed the result as
+// inches, so Bracebridge read "-279.9 in vs July avg".
+
+function syntheticCache(prefix, id, base) {
+  const days = [];
+  for (let i = 0; i < 800; i++) {
+    const date = addDays('2024-07-01', i);
+    // Julys sit at `base`, the rest of the year lower, so julyAvg is well defined
+    days.push({ date, value: date.substring(5, 7) === '07' ? base : base * 0.6 });
+  }
+  return { [`${prefix}:${id}`]: days };
+}
+
+test('flow reports a ratio, never a length', () => {
+  const cache = syntheticCache('flow', '02EB013', 20);
+  const st = buildFlowPayload(cache, '2026-09-10').stations[0];
+  assert.equal(st.measure, 'flow');
+  assert.equal(st.vsJulyIn, null, 'flow must not carry an inches value');
+  assert.ok(Number.isFinite(st.vsJulyPct), 'flow must carry a percentage');
+  // Sep sits on the off-season plateau, i.e. 60% of the July mean
+  assert.ok(Math.abs(st.vsJulyPct - 60) <= 1, `expected ~60%, got ${st.vsJulyPct}`);
+});
+
+test('level reports inches, never a ratio', () => {
+  const cache = syntheticCache('level', '02EB015', 225);
+  const st = buildLevelsPayload(cache, '2026-09-10').stations[0];
+  assert.equal(st.measure, 'level');
+  assert.equal(st.vsJulyPct, null, 'level must not carry a percentage');
+  assert.ok(Number.isFinite(st.vsJulyIn), 'level must carry an inches value');
+});
+
+test('flow gauges get a comparison series normalised to their own July mean', () => {
+  const cache = {
+    ...syntheticCache('flow', '02EB013', 20),
+    ...syntheticCache('flow', '02EB011', 150), // 7x the catchment
+  };
+  const cmp = buildFlowPayload(cache, '2026-09-10').comparison;
+  assert.equal(cmp.stations.length, 2);
+  const [, a, b] = cmp.series[cmp.series.length - 1];
+  // Normalisation must collapse the size difference: both ~60% of own July mean
+  assert.ok(Math.abs(a - b) <= 1, `gauges should normalise together, got ${a} vs ${b}`);
 });
 
 console.log(`\n${passed} passed${process.exitCode ? ' — FAILURES ABOVE' : ', 0 failed'}`);

@@ -94,7 +94,7 @@
 Muskoka.getJSON('data/overview.json').then(function (o) {
   if (!o.level) return;
   var st = { name: o.level.name, unit: 'm', format: 'f3', decimals: 3, series: o.level.series };
-  Muskoka.charts.datedSeries(document.getElementById('ch-level'), st, 90, 225.3396);
+  Muskoka.charts.datedSeries(document.getElementById('ch-level'), st, 90, 225.34);
 });
 </script>
 </body>

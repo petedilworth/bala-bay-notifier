@@ -339,7 +339,7 @@
   // The one chart where stations share an axis — only legal because the values
   // are inches from each station's own July mean, not raw gauge readings on
   // five different datums.
-  function comparison(canvas, cmp, days) {
+  function comparison(canvas, cmp, days, measure) {
     var rows = breakGaps(windowByDate(cmp.series, days));
     var labels = rows.map(function (r) { return r[0]; });
     var palette = [C.blue, C.orange, C.green, C.red, '#7B5EA7'];
@@ -351,12 +351,18 @@
         borderWidth: 1.8, pointRadius: 0, fill: false, tension: 0.25, spanGaps: false
       };
     });
+    // Flow is normalised as a ratio, so its baseline is 100% rather than 0.
+    var isFlow = measure === 'flow';
+    var baseline = isFlow ? 100 : 0;
     var o = baseOptions({
-      xMin: 0, xMax: rows.length - 1, yLabel: 'inches vs July avg', yFormat: 'signed1', unit: 'in',
+      xMin: 0, xMax: rows.length - 1,
+      yLabel: isFlow ? '% of July average' : 'inches vs July avg',
+      yFormat: isFlow ? 'f0' : 'signed1',
+      unit: isFlow ? '%' : 'in',
       xTick: function (v) { return labels[v] ? shortDate(labels[v]) : ''; },
       tipTitle: function (item) { return labels[item.parsed.x] ? longDate(labels[item.parsed.x]) : ''; }
     });
-    o.scales.y.grid.color = function (ctx) { return ctx.tick.value === 0 ? C.axis : C.grid; };
+    o.scales.y.grid.color = function (ctx) { return ctx.tick.value === baseline ? C.axis : C.grid; };
     return new Chart(canvas, { type: 'line', data: { datasets: ds }, options: o });
   }
 

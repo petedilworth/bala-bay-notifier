@@ -227,7 +227,7 @@ function monthlyMeans(days) {
 
 const DAILY_YEARS = 2; // full-resolution window shipped to the browser
 
-function stationBlock(st, days, { unit, format, decimals }, currentYear) {
+function stationBlock(st, days, { unit, format, decimals, measure }, currentYear) {
   const latest = days[days.length - 1];
   const values = days.map(d => d.value);
   const avg = julyAverage(days, currentYear);
@@ -239,11 +239,24 @@ function stationBlock(st, days, { unit, format, decimals }, currentYear) {
   return {
     id: st.id, name: st.name, label: st.label, unit, format, decimals,
     latest: { date: latest.date, value: r3(latest.value) },
+    measure,
     julyAvg: r3(avg), julyAvgYears: JULY_AVG_YEARS,
-    // Inches relative to the station's own July mean. The five level gauges sit
-    // on different datums (Bala is ~225 m above sea level, the rest are 0-10 m
-    // local), so this is the ONLY quantity comparable across stations.
-    vsJulyIn: avg === null ? null : r1((latest.value - avg) * 100 / CM_PER_INCH),
+    // How this reading sits against the station's own July mean. The two
+    // measures need different shapes:
+    //
+    // Level — inches of difference. The five gauges sit on different datums
+    // (Bala reads ~225 m above sea level, the rest 0-10 m local), so a
+    // difference from each gauge's own mean is the ONLY quantity comparable
+    // across stations.
+    //
+    // Flow — a ratio, not a difference. Discharge swings across orders of
+    // magnitude with the season (0.33 to 177 m³/s at Port Carling), so a
+    // subtraction says little; and dividing m³/s by 2.54 to call it "inches",
+    // as this did when the two measures shared one formula, is meaningless.
+    vsJulyIn: (measure === 'level' && avg !== null)
+      ? r1((latest.value - avg) * 100 / CM_PER_INCH) : null,
+    vsJulyPct: (measure === 'flow' && avg !== null && avg !== 0)
+      ? Math.round((latest.value / avg) * 100) : null,
     trailing: { d7: r3(trailingMean(days, 7)), d30: r3(trailingMean(days, 30)) },
     changes: { d1: back(1), d7: back(7), d30: back(30) },
     // Distribution and percentile span the ENTIRE record, so "52nd percentile"
@@ -263,22 +276,30 @@ export function buildLevelsPayload(cache, todayIso) {
   for (const st of LEVEL_STATIONS) {
     const days = seriesFrom(cache, `level:${st.id}`);
     if (days.length === 0) continue;
-    stations.push(stationBlock(st, days, { unit: 'm', format: 'f3', decimals: 3 }, currentYear));
+    stations.push(stationBlock(st, days, { unit: 'm', format: 'f3', decimals: 3, measure: 'level' }, currentYear));
   }
   // Normalised comparison: inches from each station's own July mean, on the
   // dates every station has in common.
   const withAvg = stations.filter(s => s.julyAvg !== null && s.series.length > 0);
   const maps = withAvg.map(s => new Map(s.series));
-  const commonDates = withAvg.length === 0 ? [] :
+  const comparison = buildComparison(withAvg, maps,
+    (v, s) => r1((v - s.julyAvg) * 100 / CM_PER_INCH));
+  return { meta: { generated: todayIso, unit: 'm' }, stations, comparison };
+}
+
+// Cross-station series on the dates every station shares. `normalise` maps a
+// raw reading to whatever quantity is actually comparable between gauges —
+// inches from each gauge's own July mean for levels, percent of it for flow.
+function buildComparison(stations, maps, normalise) {
+  const commonDates = stations.length === 0 ? [] :
     [...maps[0].keys()].filter(d => maps.every(m => m.has(d))).sort();
-  const comparison = {
-    stations: withAvg.map(s => ({ id: s.id, name: s.name })),
+  return {
+    stations: stations.map(s => ({ id: s.id, name: s.name })),
     series: commonDates.map(date => [
       date,
-      ...withAvg.map((s, i) => r1((maps[i].get(date) - s.julyAvg) * 100 / CM_PER_INCH)),
+      ...stations.map((s, i) => normalise(maps[i].get(date), s)),
     ]),
   };
-  return { meta: { generated: todayIso, unit: 'm' }, stations, comparison };
 }
 
 export function buildFlowPayload(cache, todayIso) {
@@ -295,9 +316,17 @@ export function buildFlowPayload(cache, todayIso) {
       if (days.length > 0) omitted.push({ id: st.id, name: st.name, lastDate: days[days.length - 1].date });
       continue;
     }
-    stations.push(stationBlock(st, days, { unit: 'm³/s', format: 'f1', decimals: 1 }, currentYear));
+    stations.push(stationBlock(st, days, { unit: 'm³/s', format: 'f1', decimals: 1, measure: 'flow' }, currentYear));
   }
-  return { meta: { generated: todayIso, unit: 'm³/s' }, stations, omitted };
+  // Discharge spans orders of magnitude between gauges (Port Carling peaks at
+  // 177 m³/s, Baysville at 56), so raw m³/s on one axis just ranks catchment
+  // size. Percent of each gauge's own July mean is the comparable quantity.
+  const withAvg = stations.filter(s => s.julyAvg !== null && s.julyAvg !== 0 && s.series.length > 0);
+  const maps = withAvg.map(s => new Map(s.series));
+  const comparison = buildComparison(withAvg, maps,
+    (v, s) => Math.round((v / s.julyAvg) * 100));
+
+  return { meta: { generated: todayIso, unit: 'm³/s' }, stations, omitted, comparison };
 }
 
 // Trailing window by calendar date, not by row. Slicing the last N rows spans
@@ -317,6 +346,7 @@ export function buildOverviewPayload(temp, levels, flow, todayIso) {
     level: bala && {
       name: bala.name, label: bala.label, date: bala.latest.date,
       value: bala.latest.value, unit: 'm', vsJulyIn: bala.vsJulyIn,
+      julyAvg: bala.julyAvg,
       percentile: bala.percentile, dist: bala.dist,
       trailing: bala.trailing, changes: bala.changes,
       ageDays: daysBetween(todayIso, bala.latest.date),

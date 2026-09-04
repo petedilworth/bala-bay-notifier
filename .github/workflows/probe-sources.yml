@@ -1,0 +1,28 @@
+name: Probe data sources
+
+# Manual only. The development sandbox cannot reach water.opg.com or
+# api.datastream.org, so this runs the discovery probe from a runner that can
+# and prints what those services actually serve. It writes nothing and commits
+# nothing — read the log, then design the integration against it.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Probe
+        env:
+          # Optional. Absent, the probe reports whether the API needs one.
+          DATASTREAM_API_KEY: ${{ secrets.DATASTREAM_API_KEY }}
+        run: node scripts/probe-sources.mjs

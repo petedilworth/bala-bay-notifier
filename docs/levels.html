@@ -33,7 +33,7 @@
       <h2>Bala &middot; Lake Muskoka</h2>
       <div class="big num">225.304<span class="unit">m</span></div>
       <div class="asof">Sep 3, 2026 &middot; -1.4 in vs July avg</div>
-      <p class="lede">57th percentile of 8,461 readings since 2003</p>
+      <p class="lede">57th percentile of all 8,461 readings on record (2003–2026)</p>
       <div class="table-scroll"><table class="kv">
     <tr><th></th><th>m</th></tr>
     <tr><td>1-day change</td><td class="n">-0.006</td></tr>
@@ -46,7 +46,7 @@
       <h2>Beaumaris &middot; Lake Muskoka</h2>
       <div class="big num">9.455<span class="unit">m</span></div>
       <div class="asof">Sep 3, 2026 &middot; -1.9 in vs July avg</div>
-      <p class="lede">56th percentile of 8,142 readings since 2002</p>
+      <p class="lede">56th percentile of all 8,142 readings on record (2002–2026)</p>
       <div class="table-scroll"><table class="kv">
     <tr><th></th><th>m</th></tr>
     <tr><td>1-day change</td><td class="n">-0.003</td></tr>
@@ -59,7 +59,7 @@
       <h2>Port Carling &middot; Lake Rosseau</h2>
       <div class="big num">8.905<span class="unit">m</span></div>
       <div class="asof">Sep 3, 2026 &middot; -2.4 in vs July avg</div>
-      <p class="lede">56th percentile of 1,550 readings since 2021</p>
+      <p class="lede">56th percentile of all 1,550 readings on record (2021–2026)</p>
       <div class="table-scroll"><table class="kv">
     <tr><th></th><th>m</th></tr>
     <tr><td>1-day change</td><td class="n">+0.004</td></tr>
@@ -72,7 +72,7 @@
       <h2>Port Sydney &middot; N. Branch Muskoka R.</h2>
       <div class="big num">0.839<span class="unit">m</span></div>
       <div class="asof">Sep 3, 2026 &middot; -4.7 in vs July avg</div>
-      <p class="lede">19th percentile of 1,547 readings since 2021</p>
+      <p class="lede">19th percentile of all 1,547 readings on record (2021–2026)</p>
       <div class="table-scroll"><table class="kv">
     <tr><th></th><th>m</th></tr>
     <tr><td>1-day change</td><td class="n">-0.004</td></tr>
@@ -85,7 +85,7 @@
       <h2>Baysville &middot; S. Branch Muskoka R.</h2>
       <div class="big num">7.768<span class="unit">m</span></div>
       <div class="asof">Sep 3, 2026 &middot; -2.7 in vs July avg</div>
-      <p class="lede">35th percentile of 1,545 readings since 2021</p>
+      <p class="lede">35th percentile of all 1,545 readings on record (2021–2026)</p>
       <div class="table-scroll"><table class="kv">
     <tr><th></th><th>m</th></tr>
     <tr><td>1-day change</td><td class="n">-0.000</td></tr>
@@ -149,6 +149,11 @@
     <div class="chart-box"><canvas id="ch-02EB008"></canvas></div>
     <div class="legend"><span class="swatch " style="background:#2D6A9F"></span>Daily <span class="swatch dot" style="background:#E07B4C"></span>Latest <span class="swatch " style="background:#5BA88A"></span>July avg (5-yr) &middot; the "All" view is monthly means</div>
   </div></div>
+  <div class="section"><details class="explain"><summary>Why the level steps up and down so abruptly</summary><div class="body">
+      <p>Lake Muskoka is not at a natural level. It is controlled by dams at Bala — operating since 1873 — and at Port Carling, with the Ministry of Natural Resources setting stop logs under the Muskoka River Water Management Plan and its annual lake operating plans.</p>
+      <p>That is why these charts show flat stretches broken by sudden steps rather than the smooth curve rainfall alone would produce. A step usually means logs went in or came out, not that it rained. Levels are drawn down ahead of the spring melt and held through the summer.</p>
+      <p>Nothing here is adjusted for dam operation. These are the gauge readings as published.</p>
+    </div></details></div>
   <div class="section">
     <h2>All gauges compared</h2>
     <div class="chart-card">
@@ -193,7 +198,7 @@ Muskoka.getJSON('data/levels.json').then(function (d) {
     var c = null;
     function drawCmp(days) {
       if (c) c.destroy();
-      c = Muskoka.charts.comparison(document.getElementById('ch-cmp'), d.comparison, parseInt(days, 10));
+      c = Muskoka.charts.comparison(document.getElementById('ch-cmp'), d.comparison, parseInt(days, 10), 'level');
     }
     drawCmp(90);
     Muskoka.toggleGroup(document.getElementById('ch-cmp-toggles'), drawCmp);
