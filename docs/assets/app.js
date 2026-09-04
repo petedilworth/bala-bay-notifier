@@ -291,24 +291,46 @@
   // dated series, so the same drawing code handles them.
   function datedSeries(canvas, station, days, refLine) {
     var monthly = days >= 9999 && station.monthly && station.monthly.length > 0;
-    var source = monthly
-      ? station.monthly.map(function (m) { return [m[0], m[1]]; })
-      : station.series;
+    // Monthly rows are [date, mean, min, max, n] — carry the whole row through
+    // so the within-month range can be drawn, then split it out below.
+    var source = monthly ? station.monthly : station.series;
     // A monthly series steps ~30 days at a time; the daily gap rule would break
     // it at every point.
     var rows = monthly ? breakGaps(source, 62) : breakGaps(windowByDate(source, days));
     var labels = rows.map(function (r) { return r[0]; });
     var values = rows.map(function (r) { return r[1]; });
-    var b = pad(values, refLine === null || refLine === undefined ? [] : [refLine], 0.15, station.decimals === 3 ? 0.01 : 0.1);
+    var lows = monthly ? rows.map(function (r) { return r[0] === null ? null : r[2]; }) : null;
+    var highs = monthly ? rows.map(function (r) { return r[0] === null ? null : r[3]; }) : null;
+    var b = pad(values.concat(lows || [], highs || []),
+      refLine === null || refLine === undefined ? [] : [refLine],
+      0.15, station.decimals === 3 ? 0.01 : 0.1);
 
-    var ds = [{
+    var ds = [];
+
+    // Monthly means alone flatten the thing worth seeing: a flood or a drawdown
+    // is a month whose RANGE blew out, not one whose average moved much. Draw
+    // the min-max envelope behind the mean, as a paired fill like the
+    // temperature climatology bands.
+    if (monthly) {
+      ds.push({
+        label: 'Monthly low', data: lows.map(function (v, i) { return { x: i, y: v }; }),
+        borderWidth: 0, pointRadius: 0, fill: false, tension: 0.25, spanGaps: false
+      });
+      ds.push({
+        label: 'Monthly range', data: highs.map(function (v, i) { return { x: i, y: v }; }),
+        borderWidth: 0, pointRadius: 0, fill: '-1', backgroundColor: C.band,
+        tension: 0.25, spanGaps: false
+      });
+    }
+
+    ds.push({
       label: monthly ? 'Monthly mean' : station.name,
       data: values.map(function (v, i) { return { x: i, y: v }; }),
       borderColor: C.blue, backgroundColor: C.blueSoft,
-      borderWidth: 2, fill: 'start', tension: 0.25, spanGaps: false,
+      borderWidth: 2, fill: monthly ? false : 'start', tension: 0.25, spanGaps: false,
       pointRadius: values.map(function (v, i) { return (v !== null && i === values.length - 1) ? 4 : 0; }),
       pointBackgroundColor: C.orange, pointBorderColor: '#fff', pointBorderWidth: 1.5
-    }];
+    });
     if (refLine !== null && refLine !== undefined) {
       ds.push({
         label: 'July average',

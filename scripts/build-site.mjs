@@ -162,6 +162,7 @@ function indexPage(o, temp) {
         ['7-day mean', lvl.trailing.d7 === null ? '—' : lvl.trailing.d7.toFixed(3)],
         ['30-day mean', lvl.trailing.d30 === null ? '—' : lvl.trailing.d30.toFixed(3)],
       ], ['', 'metres'])}
+      <div class="dist" id="dist-overview-level"></div>
     `, 'levels.html') : '';
 
   const tempCard = card(`
@@ -174,6 +175,7 @@ function indexPage(o, temp) {
         ['Typical (median)', t.stats.median.toFixed(1)],
         ['Range on record', `${t.stats.min.toFixed(1)}–${t.stats.max.toFixed(1)}`],
       ], ['', '°C']) : ''}
+      <div class="dist" id="dist-overview-temp"></div>
     `, 'temperature.html');
 
   const flowCard = o.flow.length ? card(`
@@ -209,6 +211,10 @@ Muskoka.getJSON('data/overview.json').then(function (o) {
   if (!o.level) return;
   var st = { name: o.level.name, unit: 'm', format: 'f3', decimals: 3, series: o.level.series };
   Muskoka.charts.datedSeries(document.getElementById('ch-level'), st, 90, ${lvl && lvl.julyAvg !== null && lvl.julyAvg !== undefined ? lvl.julyAvg : 'null'});
+  Muskoka.renderDist(document.getElementById('dist-overview-level'), o.level.dist, o.level.value, 'f3', 'm');
+  if (o.temp && o.temp.dist) {
+    Muskoka.renderDist(document.getElementById('dist-overview-temp'), o.temp.dist, o.temp.value, 'f1', '°C');
+  }
 });`;
 
   return page({
@@ -280,24 +286,28 @@ middle half = 25th percentile(pool) … 75th percentile(pool)</code>
       id: 'ch-anom', short: true,
       legend: `${sw('#E07B4C')}Warmer than usual ${sw('#2D6A9F')}Cooler than usual`,
     })}
+    ${explain('What each bar is measured against', `
+      <p>Every bar is one day of ${t.current.year} minus the typical reading for that same day of the year, taken across the other ${t.meta.years - 1} years on record. Zero means the water was exactly normal for the date.</p>
+      <code class="formula">bar = this year's reading − median(same day ±3 days, all other years)</code>
+      <p>Because the comparison moves with the calendar, a bar in April and a bar in August mean the same thing: how far the water sat from normal <em>for that date</em>. A warm bar in April does not mean the water was warm, only that it was warmer than most Aprils.</p>
+      <p>The baseline is the same ±3-day pool the bands above use, so the two charts describe the same history.</p>`)}
   </div>
 
   <div class="section">
     <h2>Yearly averages</h2>
     ${kvTable(
-      t.yearMeans.slice().reverse().slice(0, 12).map(([y, mean, n]) =>
+      t.yearMeans.slice().reverse().map(([y, mean, n]) =>
         [String(y), mean.toFixed(1), String(n)]),
       ['Year', 'Mean °C', 'Days'])}
     <p class="lede">Mean of every reading in the year. Partial years (the first and the current) average fewer days and are not comparable to full ones.</p>
   </div>`;
 
   const script = `
-var T = ${JSON.stringify({
-    latest: t.latest, current: t.current, previous: t.previous,
-    climatology: t.climatology, anomaly: t.anomaly,
-  })};
-var chart = null, allYears = null;
+// temperature.json already carries all of this; inlining a second copy in the
+// page doubled the bytes and gave the same numbers two places to drift apart.
+var T = null, chart = null, allYears = null;
 function draw(mode) {
+  if (!T) return;
   if (chart) { chart.destroy(); chart = null; }
   var el = document.getElementById('ch-clim');
   if (mode === 'all') {
@@ -314,10 +324,13 @@ function draw(mode) {
     });
   }
 }
-draw('season');
-Muskoka.toggleGroup(document.getElementById('ch-clim-toggles'), draw);
-Muskoka.charts.tempAnomaly(document.getElementById('ch-anom'), T);
-Muskoka.renderDist(document.getElementById('dist-temp'), ${JSON.stringify(t.dist)}, ${t.latest.value}, 'f1', '°C');`;
+Muskoka.getJSON('data/temperature.json').then(function (d) {
+  T = d;
+  draw('season');
+  Muskoka.charts.tempAnomaly(document.getElementById('ch-anom'), T);
+  Muskoka.renderDist(document.getElementById('dist-temp'), T.dist, T.latest.value, 'f1', '°C');
+});
+Muskoka.toggleGroup(document.getElementById('ch-clim-toggles'), draw);`;
 
   return page({
     file: 'temperature.html', title: 'Muskoka Tracker — water temperature',
@@ -339,6 +352,8 @@ function stationPage({ file, title, heading, sub, payload, comparison, note, mea
         ['1-day change', fmtChange(st.changes.d1, st.decimals)],
         ['7-day change', fmtChange(st.changes.d7, st.decimals)],
         ['30-day change', fmtChange(st.changes.d30, st.decimals)],
+        ['7-day mean', st.trailing.d7 === null ? '—' : st.trailing.d7.toFixed(st.decimals)],
+        ['30-day mean', st.trailing.d30 === null ? '—' : st.trailing.d30.toFixed(st.decimals)],
       ], ['', st.unit])}
       <div class="dist" id="dist-${st.id}"></div>
     `)).join('\n    ');
@@ -348,7 +363,7 @@ function stationPage({ file, title, heading, sub, payload, comparison, note, mea
     sub: `${st.n.toLocaleString('en-CA')} readings, ${escDate(st.firstDate)} to ${escDate(st.lastDate)}`,
     id: `ch-${st.id}`,
     toggles: [['90', '90 days', true], ['365', '1 year', false], ['730', '2 years', false], ['9999', `All ${st.years}y`, false]],
-    legend: `${sw('#2D6A9F')}Daily ${sw('#E07B4C', 'dot')}Latest${st.julyAvg !== null ? ` ${sw('#5BA88A')}July avg (${st.julyAvgYears}-yr)` : ''} &middot; the "All" view is monthly means`,
+    legend: `${sw('#2D6A9F')}Daily ${sw('#E07B4C', 'dot')}Latest${st.julyAvg !== null ? ` ${sw('#5BA88A')}July avg (${st.julyAvgYears}-yr)` : ''} &middot; the "All" view plots monthly means with each month's range shaded`,
   })).join('\n    ');
 
   const cmp = (comparison && payload.comparison && payload.comparison.series.length) ? `
@@ -498,7 +513,9 @@ async function main() {
     'flow.html': stationPage({
       file: 'flow.html', title: 'Muskoka Tracker — river flow',
       heading: 'River flow', sub: 'Discharge on the Muskoka and Indian rivers.',
-      payload: flow, comparison: true, measure: 'flow', note: '',
+      payload: flow, comparison: true, measure: 'flow',
+      note: flow.omitted.length ? `<div class="notice">${flow.omitted.map(g =>
+        `Gauge ${esc(g.id)} (${esc(g.name)}) is not shown: it stopped reporting after ${escDate(g.lastDate)}.`).join(' ')}</div>` : '',
     }),
     'about.html': aboutPage(temp, levels, flow),
   };

@@ -42,6 +42,7 @@
     <tr><td>7-day mean</td><td class="n">225.303</td></tr>
     <tr><td>30-day mean</td><td class="n">225.319</td></tr>
   </table></div>
+      <div class="dist" id="dist-overview-level"></div>
     </a><a class="card" href="temperature.html">
       <h2>Water temperature</h2>
       <div class="big num">20.6<span class="unit">°C</span><span class="alt">69°F</span></div>
@@ -53,6 +54,7 @@
     <tr><td>Typical (median)</td><td class="n">21.1</td></tr>
     <tr><td>Range on record</td><td class="n">18.4–24.5</td></tr>
   </table></div>
+      <div class="dist" id="dist-overview-temp"></div>
     </a><a class="card" href="flow.html">
       <h2>River flow</h2>
       <div class="big num">5.9<span class="unit">m³/s</span></div>
@@ -95,6 +97,10 @@ Muskoka.getJSON('data/overview.json').then(function (o) {
   if (!o.level) return;
   var st = { name: o.level.name, unit: 'm', format: 'f3', decimals: 3, series: o.level.series };
   Muskoka.charts.datedSeries(document.getElementById('ch-level'), st, 90, 225.34);
+  Muskoka.renderDist(document.getElementById('dist-overview-level'), o.level.dist, o.level.value, 'f3', 'm');
+  if (o.temp && o.temp.dist) {
+    Muskoka.renderDist(document.getElementById('dist-overview-temp'), o.temp.dist, o.temp.value, 'f1', '°C');
+  }
 });
 </script>
 </body>

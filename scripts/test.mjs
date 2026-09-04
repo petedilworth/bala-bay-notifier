@@ -273,4 +273,22 @@ test('flow gauges get a comparison series normalised to their own July mean', ()
   assert.ok(Math.abs(a - b) <= 1, `gauges should normalise together, got ${a} vs ${b}`);
 });
 
+test('monthly rows carry the within-month range, not just the mean', () => {
+  // The chart draws a min-max band from columns 2 and 3; if monthlyMeans ever
+  // stops emitting them the band silently disappears rather than erroring.
+  const days = [];
+  for (let i = 0; i < 400; i++) {
+    const date = addDays('2025-01-01', i);
+    days.push({ date, value: date.endsWith('-15') ? 10 : 5 });  // one spike a month
+  }
+  const st = buildLevelsPayload({ 'level:02EB015': days }, '2026-03-01').stations[0];
+  assert.ok(st.monthly.length >= 12, 'expected a row per month');
+  const [date, mean, min, max, n] = st.monthly[0];
+  assert.match(date, /^\d{4}-\d{2}-15$/, 'monthly rows are dated mid-month so they plot as dates');
+  assert.ok(Number.isFinite(mean) && Number.isFinite(min) && Number.isFinite(max));
+  assert.equal(min, 5);
+  assert.equal(max, 10, 'the monthly high must survive into the payload');
+  assert.ok(n > 0);
+});
+
 console.log(`\n${passed} passed${process.exitCode ? ' — FAILURES ABOVE' : ', 0 failed'}`);
