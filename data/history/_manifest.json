@@ -10,5 +10,17 @@
   "firstDate": "2002-11-01",
   "lastDate": "2026-09-03",
   "n": 8142
+ },
+ "level:02EB020": {
+  "backfilled": true,
+  "firstDate": "2002-11-01",
+  "lastDate": "2026-09-04",
+  "n": 8077
+ },
+ "level:02EB004": {
+  "backfilled": true,
+  "firstDate": "2002-01-01",
+  "lastDate": "2026-09-04",
+  "n": 8350
  }
 }
