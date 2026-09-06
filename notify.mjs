@@ -440,6 +440,96 @@ async function claimBackfillSlot(key) {
 
 // Read every archived series at once — used by the site generator, which never
 // touches the network.
+// ── Annual instantaneous peaks ──
+//
+// The daily-mean series smooths a flood crest away: Bala's 2019 daily-mean high
+// is 226.051 m, but the water rose above that within the day. The
+// hydrometric-annual-peaks collection carries the instantaneous maximum and
+// minimum per year, which is the number a flood is actually remembered by.
+//
+// Property names below come from a live probe of the collection, not from
+// guesswork: DATE, DATA_TYPE_EN, PEAK_CODE_EN, UNITS_EN, SYMBOL_EN, PEAK.
+// The *values* inside DATA_TYPE_EN and PEAK_CODE_EN have not been observed yet,
+// so nothing here matches against a specific string it has not seen — the
+// archive stores them verbatim and the site classifies loosely.
+
+const ANNUAL_PEAKS_PATH = ARCHIVE_DIR + 'annual-peaks.csv';
+const PEAK_COLUMNS = ['station', 'date', 'dataType', 'peakCode', 'units', 'value', 'symbol'];
+
+const csvEscape = (v) => {
+  const t = v === null || v === undefined ? '' : String(v);
+  return /[",\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
+};
+
+// Minimal RFC4180-ish split: these fields are free text from an API and can
+// legitimately contain commas.
+function csvSplit(line) {
+  const out = [];
+  let cur = '', quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (quoted) {
+      if (c === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+      else if (c === '"') quoted = false;
+      else cur += c;
+    } else if (c === '"') quoted = true;
+    else if (c === ',') { out.push(cur); cur = ''; }
+    else cur += c;
+  }
+  out.push(cur);
+  return out;
+}
+
+export function parseAnnualPeakFeatures(features, stationId) {
+  return (features || []).map(f => f.properties || {})
+    .map(p => ({
+      station: stationId,
+      date: String(p.DATE ?? '').substring(0, 10),
+      dataType: p.DATA_TYPE_EN ?? '',
+      peakCode: p.PEAK_CODE_EN ?? '',
+      units: p.UNITS_EN ?? '',
+      value: Number(p.PEAK),
+      symbol: p.SYMBOL_EN ?? '',
+    }))
+    .filter(r => /^\d{4}-\d{2}-\d{2}$/.test(r.date) && Number.isFinite(r.value));
+}
+
+async function fetchAnnualPeaks(stationId) {
+  try {
+    const feats = await fetchAllFeatures(
+      (lim, off) => `${API_BASE}/hydrometric-annual-peaks/items?f=json&STATION_NUMBER=${stationId}&limit=${lim}&offset=${off}`,
+      20
+    );
+    return parseAnnualPeakFeatures(feats, stationId);
+  } catch (e) {
+    console.log(`    Annual peaks failed for ${stationId}: ${e.message}`);
+    return [];
+  }
+}
+
+export async function loadAnnualPeaks() {
+  try {
+    const text = await fs.readFile(ANNUAL_PEAKS_PATH, 'utf8');
+    return text.trim().split('\n').slice(1).map(line => {
+      const c = csvSplit(line);
+      const row = {};
+      PEAK_COLUMNS.forEach((k, i) => { row[k] = c[i] ?? ''; });
+      row.value = Number(row.value);
+      return row;
+    }).filter(r => r.station && Number.isFinite(r.value));
+  } catch {
+    return [];
+  }
+}
+
+async function saveAnnualPeaks(rows) {
+  await fs.mkdir(ARCHIVE_DIR, { recursive: true });
+  const sorted = [...rows].sort((a, b) =>
+    a.station.localeCompare(b.station) || a.date.localeCompare(b.date) || a.peakCode.localeCompare(b.peakCode));
+  const body = sorted.map(r => PEAK_COLUMNS.map(k => csvEscape(r[k])).join(','));
+  await fs.writeFile(ANNUAL_PEAKS_PATH, PEAK_COLUMNS.join(',') + '\n' + body.join('\n') + '\n', 'utf8');
+}
+
 export async function loadAllArchives() {
   const out = {};
   let names = [];
@@ -1643,6 +1733,22 @@ async function main() {
 
   // All station/flow fetches are done — persist the observation cache so the
   // workflow's data-commit step picks it up
+  // Annual instantaneous peaks: one small request per station, annual data, so
+  // this is cheap next to everything above.
+  const peakStations = [...new Set([STATION, ...EXTRA_STATIONS.map(s => s.id), ...FLOW_STATIONS.map(s => s.id)])];
+  const peakRows = [];
+  for (const id of peakStations) peakRows.push(...await fetchAnnualPeaks(id));
+  if (peakRows.length > 0) {
+    await saveAnnualPeaks(peakRows);
+    const types = [...new Set(peakRows.map(r => r.dataType))];
+    const codes = [...new Set(peakRows.map(r => r.peakCode))];
+    console.log(`  Annual peaks: ${peakRows.length} rows across ${peakStations.length} stations`);
+    console.log(`    DATA_TYPE_EN values: ${types.join(' | ')}`);
+    console.log(`    PEAK_CODE_EN values: ${codes.join(' | ')}`);
+  } else {
+    console.log('  Annual peaks: none returned; keeping any existing archive');
+  }
+
   await saveManifest();
   console.log('  Level/flow archive saved');
 

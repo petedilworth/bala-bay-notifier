@@ -9,13 +9,13 @@
 import assert from 'node:assert/strict';
 import {
   filterOutliers, readingNDaysBack, median, poolAroundDay, addDays, toRecord,
-  mergeSeries, parseMurAscii, computeNextWeekTempForecast,
+  mergeSeries, parseMurAscii, computeNextWeekTempForecast, parseAnnualPeakFeatures,
 } from '../notify.mjs';
 import {
   quantile, distribution, percentileOf, climatology, windowByDate,
   buildLevelsPayload, buildFlowPayload, buildRecordsPayload,
   dayOfYearEnvelope, withDayOfYear, extremes, biggestSwings, longestStreak, onThisDate,
-  coverageGaps, recentCoverageGaps,
+  coverageGaps, recentCoverageGaps, peaksFor,
 } from './lib/payloads.mjs';
 
 let passed = 0;
@@ -450,6 +450,65 @@ test('the records payload reports the gap it cannot see past', () => {
   assert.ok(r.meta.coverage, 'a five-month hole must be reported');
   assert.equal(r.meta.coverage.to, '2026-06-06', 'last missing day');
   assert.ok(r.meta.coverage.commonFrom > '2025-11-01', `unexpected start ${r.meta.coverage.commonFrom}`);
+});
+
+// ── annual instantaneous peaks ──
+// Property names below are the real ones, taken from a live probe of
+// hydrometric-annual-peaks. The VALUES inside DATA_TYPE_EN and PEAK_CODE_EN
+// have not been observed, so nothing may depend on a particular string.
+
+const peakFeature = (st, date, type, code, units, peak) => ({ properties: {
+  DATE: date + 'T00:00:00Z', STATION_NUMBER: st, DATA_TYPE_EN: type,
+  PEAK_CODE_EN: code, UNITS_EN: units, SYMBOL_EN: '', PEAK: peak } });
+
+test('peak features parse, and junk rows are dropped', () => {
+  const rows = parseAnnualPeakFeatures([
+    peakFeature('02EB015', '2019-05-03', 'Water Level', 'Maximum', 'm', 226.42),
+    peakFeature('02EB015', '2019-03-15', 'Water Level', 'Minimum', 'm', 224.30),
+    { properties: { DATE: null, PEAK: 5 } },              // no date
+    { properties: { DATE: '2019-01-01', PEAK: 'n/a' } },  // unparseable value
+  ], '02EB015');
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].date, '2019-05-03', 'timestamp trimmed to a date');
+  assert.equal(rows[0].value, 226.42);
+});
+
+test('crest is taken from the values, not from a label string', () => {
+  // PEAK_CODE_EN vocabulary is unobserved, so an unfamiliar label must not
+  // break the classification.
+  const rows = parseAnnualPeakFeatures([
+    peakFeature('02EB015', '2019-05-03', 'Water Level', 'ANNUAL MAX', 'm', 226.42),
+    peakFeature('02EB015', '2005-03-01', 'Water Level', 'whatever', 'm', 224.10),
+    peakFeature('02EB015', '2012-04-01', 'Water Level', '', 'm', 225.50),
+  ], '02EB015');
+  const p = peaksFor(rows, '02EB015', 'level');
+  assert.equal(p.high.value, 226.42);
+  assert.equal(p.high.date, '2019-05-03');
+  assert.equal(p.low.value, 224.10);
+  assert.equal(p.firstYear, '2005');
+  assert.equal(p.lastYear, '2019');
+});
+
+test('level and flow peaks do not contaminate each other', () => {
+  const rows = parseAnnualPeakFeatures([
+    peakFeature('02EB004', '2019-04-26', 'Water Level', 'Maximum', 'm', 3.6),
+    peakFeature('02EB004', '2019-04-26', 'Discharge', 'Maximum', 'm3/s', 234),
+  ], '02EB004');
+  assert.equal(peaksFor(rows, '02EB004', 'level').high.value, 3.6);
+  assert.equal(peaksFor(rows, '02EB004', 'flow').high.value, 234);
+  assert.equal(peaksFor(rows, '02EB999', 'level'), null, 'unknown station yields nothing');
+});
+
+test('an unrecognised data type falls back to units, then gives up', () => {
+  const byUnits = parseAnnualPeakFeatures([
+    peakFeature('02EB015', '2019-05-03', 'Mystery', 'Max', 'm3/s', 99),
+  ], '02EB015');
+  assert.ok(peaksFor(byUnits, '02EB015', 'flow'), 'units should rescue it');
+  const hopeless = parseAnnualPeakFeatures([
+    peakFeature('02EB015', '2019-05-03', 'Mystery', 'Max', 'furlongs', 99),
+  ], '02EB015');
+  assert.equal(peaksFor(hopeless, '02EB015', 'level'), null);
+  assert.equal(peaksFor(hopeless, '02EB015', 'flow'), null);
 });
 
 console.log(`\n${passed} passed${process.exitCode ? ' — FAILURES ABOVE' : ', 0 failed'}`);

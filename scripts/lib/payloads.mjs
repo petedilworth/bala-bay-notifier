@@ -7,7 +7,7 @@
 import fs from 'node:fs/promises';
 import {
   median, poolAroundDay, toRecord, addDays, daysBetween, readingNDaysBack,
-  computeTodayTempStats, computeNextWeekTempForecast, loadAllArchives,
+  computeTodayTempStats, computeNextWeekTempForecast, loadAllArchives, loadAnnualPeaks,
   STATION, EXTRA_STATIONS, FLOW_STATIONS, CM_PER_INCH,
   TEMP_CSV_PATH,
 } from '../../notify.mjs';
@@ -251,6 +251,42 @@ export function coverageGaps(days, minGapDays = 5) {
 export function recentCoverageGaps(days, todayIso, withinDays = 730, minGapDays = 5) {
   const cutoff = addDays(todayIso, -withinDays);
   return coverageGaps(days, minGapDays).filter(g => g.to >= cutoff);
+}
+
+// ── annual instantaneous peaks ──
+
+export async function loadPeaks() { return loadAnnualPeaks(); }
+
+// Classify by matching loosely rather than against exact strings, because the
+// values inside DATA_TYPE_EN have not been observed — only the field name has.
+// Falls back to units, then gives up rather than guessing wrong.
+function peakMeasure(row) {
+  const t = String(row.dataType).toLowerCase();
+  if (/level|elevation|stage/.test(t)) return 'level';
+  if (/discharge|flow/.test(t)) return 'flow';
+  const u = String(row.units).toLowerCase();
+  if (/m3|m³|cms/.test(u)) return 'flow';
+  if (/^m$|metre|meter/.test(u)) return 'level';
+  return null;
+}
+
+// The instantaneous high and low for one gauge and measure. Derived from the
+// values themselves rather than from PEAK_CODE_EN, whose vocabulary is also
+// unobserved — the largest row is the crest whatever it is labelled.
+export function peaksFor(rows, stationId, measure) {
+  const mine = rows.filter(r => r.station === stationId && peakMeasure(r) === measure);
+  if (mine.length === 0) return null;
+  let high = mine[0], low = mine[0];
+  for (const r of mine) {
+    if (r.value > high.value) high = r;
+    if (r.value < low.value) low = r;
+  }
+  const years = [...new Set(mine.map(r => r.date.substring(0, 4)))].sort();
+  return {
+    high: { date: high.date, value: r3(high.value) },
+    low: { date: low.date, value: r3(low.value) },
+    n: mine.length, firstYear: years[0], lastYear: years[years.length - 1],
+  };
 }
 
 // ── records ──
@@ -518,7 +554,7 @@ export function windowByDate(rows, days) {
 // Sydney's flow reaches 1915 while three other flow gauges start in 2021 — so
 // every entry carries its own period of record. A "record high" off five years
 // and one off a century are not the same claim.
-export function buildRecordsPayload(temps, cache, todayIso) {
+export function buildRecordsPayload(temps, cache, todayIso, peakRows = []) {
   const monthDay = todayIso.substring(5);
   const gauge = (st, key, unit, format, decimals, measure) => {
     const days = seriesFrom(cache, key);
@@ -535,6 +571,9 @@ export function buildRecordsPayload(temps, cache, todayIso) {
       swings: biggestSwings(days, 7, 5),
       onThisDate: onThisDate(days, monthDay),
       gaps: recentCoverageGaps(days, todayIso),
+      // Instantaneous crest, which runs higher than any daily mean. Null until
+      // the daily job has fetched the annual-peaks collection at least once.
+      peaks: peaksFor(peakRows, st.id, measure),
     };
   };
 

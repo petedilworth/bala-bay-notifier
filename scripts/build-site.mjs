@@ -14,6 +14,7 @@ import {
 import {
   loadTemps, loadLevelCache, buildTemperaturePayload, buildAllYearsPayload,
   buildLevelsPayload, buildFlowPayload, buildOverviewPayload, buildRecordsPayload,
+  loadPeaks,
 } from './lib/payloads.mjs';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -458,16 +459,30 @@ function recordsPage(r) {
   const fmtV = (v, d) => v === null || v === undefined ? '—' : v.toFixed(d);
   const cov = (g) => `${g.firstDate.substring(0, 4)}–${g.lastDate.substring(0, 4)}`;
 
-  const gaugeTable = (gauges, heading) => gauges.length === 0 ? '' : `
+  // Instantaneous crests are a different measurement from daily means, not a
+  // better version of the same one, so they get their own column rather than
+  // quietly replacing the daily figure.
+  const gaugeTable = (gauges, heading) => {
+    if (gauges.length === 0) return '';
+    const anyPeaks = gauges.some(g => g.peaks);
+    const head = ['Gauge', `Highest daily mean (${gauges[0].unit})`,
+      ...(anyPeaks ? [`Instantaneous crest (${gauges[0].unit})`] : []),
+      `Lowest daily mean (${gauges[0].unit})`, 'Record'];
+    return `
   <div class="section">
     <h2>${heading}</h2>
     ${kvTable(gauges.map(g => [
       `${esc(g.name)} <span style="color:var(--faint)">${esc(g.label)}</span>`,
       `${fmtV(g.extremes.high.value, g.decimals)} <span style="color:var(--faint)">${escDate(g.extremes.high.date)}</span>`,
+      ...(anyPeaks ? [g.peaks
+        ? `${fmtV(g.peaks.high.value, g.decimals)} <span style="color:var(--faint)">${escDate(g.peaks.high.date)}</span>`
+        : '—'] : []),
       `${fmtV(g.extremes.low.value, g.decimals)} <span style="color:var(--faint)">${escDate(g.extremes.low.date)}</span>`,
       `${cov(g)} <span style="color:var(--faint)">${g.n.toLocaleString('en-CA')}</span>`,
-    ]), ['Gauge', `Highest (${gauges[0].unit})`, `Lowest (${gauges[0].unit})`, 'Record'])}
+    ]), head)}
+    ${anyPeaks ? `<p class="lede">The crest column is the highest instantaneous reading Environment Canada recorded that year, which is higher than any daily average of the same flood.</p>` : ''}
   </div>`;
+  };
 
   const swingTable = (gauges, heading) => {
     const rows = [];
@@ -520,8 +535,10 @@ function recordsPage(r) {
   <div class="cards">
     ${card(`
       <h2>Highest in the published record</h2>
-      <div class="big num">${fmtV(r.levels[0]?.extremes.high.value, 3)}<span class="unit">m</span></div>
-      <div class="asof">${esc(r.levels[0]?.name ?? '')} &middot; ${escDate(r.levels[0]?.extremes.high.date ?? '')}${gapInfo ? ' &middot; excludes the gap above' : ''}</div>
+      <div class="big num">${fmtV(r.levels[0]?.peaks?.high.value ?? r.levels[0]?.extremes.high.value, 3)}<span class="unit">m</span></div>
+      <div class="asof">${esc(r.levels[0]?.name ?? '')} &middot; ${escDate((r.levels[0]?.peaks?.high ?? r.levels[0]?.extremes.high)?.date ?? '')}`
+      + `${r.levels[0]?.peaks ? ' &middot; instantaneous crest' : ' &middot; daily mean'}`
+      + `${gapInfo ? ' &middot; excludes the gap above' : ''}</div>
       <p class="lede">${(() => {
         // Derive this rather than assert it: four gauges peaked in 2019 but
         // Port Carling's high is from 2013, and a hand-written sentence about
@@ -582,7 +599,7 @@ function recordsPage(r) {
   ${explain('Why these records are not equally impressive', `
     <p>Coverage is very uneven. Port Sydney's flow gauge has run since 1915, so its record low genuinely survived a century. Three other flow gauges only start in 2021, so their "records" describe about five years.</p>
     <p>Every row above carries its period of record for that reason. A record high off five years and one off a hundred are not the same claim, and nothing here averages them together.</p>
-    <p>Level readings are daily means published by Environment and Climate Change Canada, so a brief peak within a day is smoothed away — the true instantaneous crest in 2019 was higher than the figure shown. Temperatures are satellite surface readings, not a thermometer in the water.</p>
+    <p>Most figures here are daily means published by Environment and Climate Change Canada, so a brief peak within a day is smoothed away. Where a crest column appears, that is the instantaneous annual maximum from Environment Canada's own peaks record — the number a flood is actually remembered by — and it is not comparable to a daily average. Temperatures are satellite surface readings, not a thermometer in the water.</p>
     <p><strong>The published series also lags.</strong> Environment Canada releases each station's daily means on its own schedule, often a year or more behind, and this site's own record only starts when it began caching readings. That leaves the window named at the top of this page with no data at all, so any peak inside it is absent from every figure here. Nothing on this page is wrong about the days it can see; it simply cannot see those days. The gap closes on its own as the daily means are published, because each run re-requests the last five years rather than only new dates.</p>`)}`;
 
   return page({
@@ -648,13 +665,13 @@ async function writeJSON(name, obj) {
 async function main() {
   console.log('Building site from data/ (no network)...');
 
-  const [temps, cache] = await Promise.all([loadTemps(), loadLevelCache()]);
+  const [temps, cache, peakRows] = await Promise.all([loadTemps(), loadLevelCache(), loadPeaks()]);
   const temp = buildTemperaturePayload(temps, CURRENT_YEAR, TODAY_ISO);
   const allYears = buildAllYearsPayload(temps, CURRENT_YEAR);
   const levels = buildLevelsPayload(cache, TODAY_ISO);
   const flow = buildFlowPayload(cache, TODAY_ISO);
   const overview = buildOverviewPayload(temp, levels, flow, TODAY_ISO);
-  const records = buildRecordsPayload(temps, cache, TODAY_ISO);
+  const records = buildRecordsPayload(temps, cache, TODAY_ISO, peakRows);
 
   console.log(`  ${temps.length} temperature readings, ${temp.meta.years} years`);
   console.log(`  ${levels.stations.length} level gauges, ${flow.stations.length} flow gauges` +
