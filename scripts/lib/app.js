@@ -304,6 +304,14 @@
     var b = pad(values.concat(lows || [], highs || []),
       refLine === null || refLine === undefined ? [] : [refLine],
       0.15, station.decimals === 3 ? 0.01 : 0.1);
+    // Discharge cannot go negative, and Port Sydney's record runs to 0.0 m³/s,
+    // so padding below the minimum put a quarter of the plot below zero on
+    // values that cannot exist. Only bites series that approach zero: a lake
+    // level near 225 m is nowhere near the floor.
+    var observed = values.concat(lows || []).filter(function (v) {
+      return v !== null && v !== undefined && isFinite(v);
+    });
+    if (observed.length && Math.min.apply(null, observed) >= 0 && b.min < 0) b.min = 0;
 
     var ds = [];
 
