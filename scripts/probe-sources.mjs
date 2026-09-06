@@ -180,6 +180,18 @@ async function probeDataStream() {
   const inBox = (r) => r.Latitude >= +MUSKOKA_BOX.latMin && r.Latitude <= +MUSKOKA_BOX.latMax
     && r.Longitude >= +MUSKOKA_BOX.lonMin && r.Longitude <= +MUSKOKA_BOX.lonMax;
 
+  // A bare request with no filter at all. Two quite different filters returned
+  // the same 400 with an empty body, so the query may not be the problem: some
+  // gateways answer an unauthenticated request with 400 rather than 401. This
+  // control separates "my query is malformed" from "no key". Without it, the
+  // 400 was read as a query bug once already, wrongly.
+  const control = await dsGet(`${base}/Metadata?$top=1`, headers,
+    'CONTROL: no filter, no select, one row');
+  if (!control) {
+    console.log(dim('    A bare request failing too points at credentials or the'));
+    console.log(dim('    endpoint itself, not at the Muskoka query below.'));
+  }
+
   // 1. Which datasets cover this area, and under what licence?
   const meta = await dsGet(
     `${base}/Metadata?$filter=${encodeURIComponent(region)}`
@@ -294,17 +306,37 @@ async function probeEnvironmentCanada() {
   await robots('https://wateroffice.ec.gc.ca', '/download/');
   // robots permits /download/, so look at what the page offers rather than
   // guessing an endpoint. Still reporting only: nothing is parsed or stored.
-  for (const path of ['/download/index_e.html', '/search/historical_e.html']) {
+  // /search/historical_e.html searches HYDAT — the same source that stops at
+  // 2025, so it cannot hold spring 2026. Water Office keeps a separate realtime
+  // pool with its own retention, which is the only part worth chasing.
+  for (const path of ['/search/real_time_e.html', '/download/index_e.html']) {
     const r = await get('https://wateroffice.ec.gc.ca' + path);
     console.log(`  ${path}: ${r.ok ? ok(`HTTP ${r.status}`) : bad(`HTTP ${r.status || r.error}`)}`);
     if (!r.ok) continue;
     const forms = [...new Set((r.text.match(/<form[^>]*action=["']([^"']+)["']/gi) || [])
       .map(m => m.replace(/.*action=["']/i, '').replace(/["']$/, '')))].slice(0, 8);
-    const csv = [...new Set((r.text.match(/href=["']([^"']*(?:csv|download)[^"']*)["']/gi) || [])
+    const csv = [...new Set((r.text.match(/href=["']([^"']*(?:csv|download|services)[^"']*)["']/gi) || [])
       .map(m => m.replace(/.*href=["']/i, '').replace(/["']$/, '')))].slice(0, 8);
     console.log(`    form actions: ${forms.length ? forms.join(', ') : dim('none')}`);
-    console.log(`    csv/download links: ${csv.length ? csv.join(', ') : dim('none')}`);
+    console.log(`    csv/download/services links: ${csv.length ? csv.join(', ') : dim('none')}`);
+    // Retention is the whole question: how far back does the realtime pool go?
+    const dates = [...new Set((r.text.match(/\b(19|20)\d{2}-\d{2}-\d{2}\b/g) || []))].sort();
+    if (dates.length) console.log(`    dates mentioned on the page: ${dates[0]} … ${dates[dates.length - 1]}`);
     await pause(500);
+  }
+
+  // MSC Datamart is explicitly open data and publishes hydrometric CSVs
+  // directly, with no form to drive.
+  head('MSC Datamart — dd.weather.gc.ca hydrometric CSVs');
+  for (const path of ['/hydrometric/csv/ON/daily/', '/hydrometric/csv/ON/hourly/']) {
+    const r = await get('https://dd.weather.gc.ca' + path);
+    console.log(`  ${path}: ${r.ok ? ok(`HTTP ${r.status}`) : bad(`HTTP ${r.status || r.error}`)}`);
+    if (!r.ok) continue;
+    const ours = [...new Set((r.text.match(/href=["']([^"']*02EB015[^"']*)["']/gi) || [])
+      .map(m => m.replace(/.*href=["']/i, '').replace(/["']$/, '')))].slice(0, 5);
+    const all = (r.text.match(/href=["'][^"']*\.csv["']/gi) || []).length;
+    console.log(`    ${all} csv files listed; for 02EB015: ${ours.length ? ok(ours.join(', ')) : dim('none')}`);
+    await pause(400);
   }
 }
 
