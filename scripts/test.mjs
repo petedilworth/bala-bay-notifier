@@ -14,6 +14,7 @@ import {
 import {
   quantile, distribution, percentileOf, climatology, windowByDate,
   buildLevelsPayload, buildFlowPayload,
+  dayOfYearEnvelope, withDayOfYear, extremes, biggestSwings, longestStreak, onThisDate,
 } from './lib/payloads.mjs';
 
 let passed = 0;
@@ -290,5 +291,112 @@ test('monthly rows carry the within-month range, not just the mean', () => {
   assert.equal(max, 10, 'the monthly high must survive into the payload');
   assert.ok(n > 0);
 });
+
+// ── day-of-year normals on a {date,value} series ──
+
+test('envelope works on plain {date,value} archive rows', () => {
+  // climatology() reads r.tempC; the archive has r.value. The generic version
+  // must handle the archive shape without a temperature-specific accessor.
+  const recs = [];
+  for (const y of [2023, 2024, 2025]) {
+    for (let d = 0; d < 365; d++) recs.push(withDayOfYear(addDays(`${y}-01-01`, d), 100 + d));
+  }
+  const rows = dayOfYearEnvelope(recs, 2026);
+  assert.equal(rows.length, 366);
+  const day50 = rows[49];
+  assert.equal(day50[0], 50);
+  assert.ok(Number.isFinite(day50[3]), 'median should be a number');
+});
+
+test('envelope keeps 3-decimal precision for levels', () => {
+  // 1-decimal rounding would flatten Bala's whole 224.28-226.05 m range.
+  const recs = [];
+  for (const y of [2023, 2024, 2025]) {
+    for (let d = 0; d < 20; d++) recs.push(withDayOfYear(addDays(`${y}-06-01`, d), 225.123 + d * 0.001));
+  }
+  const row = dayOfYearEnvelope(recs, 2026)[withDayOfYear('2026-06-10', 0).dayOfYear - 1];
+  assert.ok(String(row[3]).includes('.'), 'median should not be an integer');
+  assert.ok(Math.abs(row[3] - 225.13) < 0.02, `expected ~225.13, got ${row[3]}`);
+});
+
+test('a station with too little history gets no normal', () => {
+  // Two winters is not a normal. Guard is 3 prior years.
+  const two = [];
+  for (const y of [2025, 2026]) {
+    for (let d = 0; d < 365; d++) two.push({ date: addDays(`${y}-01-01`, d), value: 5 });
+  }
+  const shallow = buildLevelsPayload({ 'level:02EB015': two }, '2026-09-06').stations[0];
+  assert.equal(shallow.normal, null, 'two years must not produce a normal');
+
+  const four = [];
+  for (const y of [2022, 2023, 2024, 2025, 2026]) {
+    for (let d = 0; d < 365; d++) four.push({ date: addDays(`${y}-01-01`, d), value: 5 });
+  }
+  const deep = buildLevelsPayload({ 'level:02EB015': four }, '2026-09-06').stations[0];
+  assert.ok(deep.normal, 'four prior years should produce a normal');
+  assert.equal(deep.normal.years, 4);
+});
+
+// ── records ──
+
+test('extremes returns the dates, which distribution() drops', () => {
+  const days = [
+    { date: '2020-01-01', value: 5 }, { date: '2020-06-15', value: 9 },
+    { date: '2021-03-02', value: 1 }, { date: '2021-08-08', value: 7 },
+  ];
+  const e = extremes(days);
+  assert.equal(e.high.value, 9); assert.equal(e.high.date, '2020-06-15');
+  assert.equal(e.low.value, 1);  assert.equal(e.low.date, '2021-03-02');
+  assert.equal(extremes([]), null);
+});
+
+test('swings compare by date, so a gap cannot fake a jump', () => {
+  // Two blocks a year apart. A row-based diff would call the seam a huge
+  // 7-day swing; a date-based one skips it because no reading is 7 days back.
+  const days = [
+    ...Array.from({ length: 10 }, (_, i) => ({ date: addDays('2024-01-01', i), value: 10 })),
+    ...Array.from({ length: 10 }, (_, i) => ({ date: addDays('2025-06-01', i), value: 90 })),
+  ];
+  const sw = biggestSwings(days, 7, 5);
+  assert.equal(sw.rises.length, 0, 'no genuine 7-day rise exists here');
+  assert.equal(sw.falls.length, 0);
+});
+
+test('swings find a real rise with its dates', () => {
+  const days = Array.from({ length: 30 }, (_, i) => ({
+    date: addDays('2024-01-01', i), value: i < 10 ? 1 : 5,
+  }));
+  const top = biggestSwings(days, 7, 3).rises[0];
+  assert.ok(top, 'expected a rise');
+  assert.equal(top.change, 4);
+  assert.equal(daysBetweenISO(top.from, top.to), 7);
+});
+
+test('streak breaks at a hole rather than bridging it', () => {
+  const days = [
+    ...Array.from({ length: 5 }, (_, i) => ({ date: addDays('2024-06-01', i), value: 25 })),
+    // 30-day hole, then a longer warm run
+    ...Array.from({ length: 8 }, (_, i) => ({ date: addDays('2024-07-10', i), value: 25 })),
+  ];
+  const s = longestStreak(days, v => v >= 20);
+  assert.equal(s.length, 8, 'the two runs must not be joined across the hole');
+  assert.equal(s.start, '2024-07-10');
+});
+
+test('onThisDate matches the exact calendar date across years', () => {
+  const days = [
+    { date: '2020-09-06', value: 3 }, { date: '2021-09-06', value: 7 },
+    { date: '2021-09-07', value: 99 }, { date: '2022-09-06', value: 5 },
+  ];
+  const o = onThisDate(days, '09-06');
+  assert.equal(o.n, 3, 'Sep 7 must not be counted');
+  assert.equal(o.high.value, 7);
+  assert.equal(o.low.value, 3);
+  assert.equal(o.median, 5);
+});
+
+function daysBetweenISO(a, b) {
+  return Math.round((Date.parse(b + 'T12:00:00Z') - Date.parse(a + 'T12:00:00Z')) / 86400000);
+}
 
 console.log(`\n${passed} passed${process.exitCode ? ' — FAILURES ABOVE' : ', 0 failed'}`);

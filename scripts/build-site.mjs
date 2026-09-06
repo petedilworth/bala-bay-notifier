@@ -13,7 +13,7 @@ import {
 } from '../notify.mjs';
 import {
   loadTemps, loadLevelCache, buildTemperaturePayload, buildAllYearsPayload,
-  buildLevelsPayload, buildFlowPayload, buildOverviewPayload,
+  buildLevelsPayload, buildFlowPayload, buildOverviewPayload, buildRecordsPayload,
 } from './lib/payloads.mjs';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -31,6 +31,7 @@ const NAV = [
   ['temperature.html', 'Temperature'],
   ['levels.html', 'Water levels'],
   ['flow.html', 'River flow'],
+  ['records.html', 'Records'],
   ['about.html', 'About'],
 ];
 
@@ -118,6 +119,20 @@ function vsJuly(st) {
     return ` &middot; ${st.vsJulyIn > 0 ? '+' : ''}${st.vsJulyIn.toFixed(1)} in vs July avg`;
   }
   return '';
+}
+
+// The second comparison: how today sits against normal for its own calendar
+// date. "vs July avg" applies one summer number to all 365 days, so on its own
+// it says little in February. Always states how many years the normal rests on,
+// because a shallow gauge can report a 100th percentile off four years.
+function vsNormal(st) {
+  const n = st.normal;
+  if (!n) return '';
+  const amount = st.measure === 'flow'
+    ? `${n.vsNormalPct}% of normal`
+    : `${n.vsNormalIn > 0 ? '+' : ''}${n.vsNormalIn.toFixed(1)} in vs normal`;
+  return `<p class="lede">${amount} for ${escDate(st.latest.date).replace(/, \d{4}$/, '')}`
+    + ` &middot; ${pctLine(n.percentile, `for this date across ${n.years} years (${n.earliestYear}–${n.latestYear})`)}</p>`;
 }
 
 const sw = (color, cls) => `<span class="swatch ${cls || ''}" style="background:${color}"></span>`;
@@ -341,13 +356,22 @@ Muskoka.toggleGroup(document.getElementById('ch-clim-toggles'), draw);`;
 }
 
 function stationPage({ file, title, heading, sub, payload, comparison, note, measure }) {
+  const withNormal = payload.stations.find(st => st.normal);
+  const normalNote = withNormal ? explain('What "normal for the date" means', `
+      <p>Two comparisons sit on each card and they answer different questions. <strong>Vs July average</strong> compares against the mean of every July day in the last five years: a fixed summer benchmark, useful for "is the lake up or down for the season". <strong>Vs normal for the date</strong> compares against what this gauge has actually done on this calendar date across its whole record.</p>
+      <code class="formula">normal(date) = median of readings from date−3 … date+3, every year except this one</code>
+      <p>The second is the one that stays meaningful in February, when comparing to July says little. The shaded bands on the charts are that same calculation drawn across the whole window: the darker band is the middle half of past years, the lighter one the full recorded range, and the dashed line the median.</p>
+      <p>A normal needs depth to mean anything, so it is only shown for gauges with at least three prior years, and every card states how many years its normal rests on. ${esc(withNormal.name)}'s rests on ${withNormal.normal.years}.</p>`) : '';
+
   const managedNote = measure === 'level'
-    ? `\n  <div class="section">${MANAGED_EXPLAINER}</div>` : '';
+    ? `\n  <div class="section">${MANAGED_EXPLAINER}${normalNote}</div>`
+    : (normalNote ? `\n  <div class="section">${normalNote}</div>` : '');
   const cards = payload.stations.map(st => card(`
       <h2>${esc(st.name)} &middot; ${esc(st.label)}</h2>
       <div class="big num">${st.latest.value.toFixed(st.decimals)}<span class="unit">${esc(st.unit)}</span></div>
       <div class="asof">${escDate(st.latest.date)}${vsJuly(st)}</div>
       <p class="lede">${pctLine(st.percentile, `of all ${st.n.toLocaleString('en-CA')} readings on record (${st.firstDate.substring(0, 4)}–${st.lastDate.substring(0, 4)})`)}</p>
+      ${vsNormal(st)}
       ${kvTable([
         ['1-day change', fmtChange(st.changes.d1, st.decimals)],
         ['7-day change', fmtChange(st.changes.d7, st.decimals)],
@@ -363,7 +387,10 @@ function stationPage({ file, title, heading, sub, payload, comparison, note, mea
     sub: `${st.n.toLocaleString('en-CA')} readings, ${escDate(st.firstDate)} to ${escDate(st.lastDate)}`,
     id: `ch-${st.id}`,
     toggles: [['90', '90 days', true], ['365', '1 year', false], ['730', '2 years', false], ['9999', `All ${st.years}y`, false]],
-    legend: `${sw('#2D6A9F')}Daily ${sw('#E07B4C', 'dot')}Latest${st.julyAvg !== null ? ` ${sw('#5BA88A')}July avg (${st.julyAvgYears}-yr)` : ''} &middot; the "All" view plots monthly means with each month's range shaded`,
+    legend: `${sw('#2D6A9F')}Daily ${sw('#E07B4C', 'dot')}Latest`
+      + `${st.julyAvg !== null ? ` ${sw('#5BA88A')}July avg (${st.julyAvgYears}-yr)` : ''}`
+      + `${st.normal ? ` ${sw('#6B6B6B')}Normal for the date ${sw('rgba(107,142,173,0.28)', 'band')}Middle half ${sw('rgba(107,142,173,0.16)', 'band')}Full range` : ''}`
+      + ` &middot; the "All" view switches to monthly means with each month's range shaded`,
   })).join('\n    ');
 
   const cmp = (comparison && payload.comparison && payload.comparison.series.length) ? `
@@ -424,6 +451,131 @@ function fmtChange(c, decimals) {
   if (!c) return '—';
   const v = c.change;
   return `${v > 0 ? '+' : ''}${v.toFixed(decimals)}`;
+}
+
+function recordsPage(r) {
+  const t = r.temperature;
+  const fmtV = (v, d) => v === null || v === undefined ? '—' : v.toFixed(d);
+  const cov = (g) => `${g.firstDate.substring(0, 4)}–${g.lastDate.substring(0, 4)}`;
+
+  const gaugeTable = (gauges, heading) => gauges.length === 0 ? '' : `
+  <div class="section">
+    <h2>${heading}</h2>
+    ${kvTable(gauges.map(g => [
+      `${esc(g.name)} <span style="color:var(--faint)">${esc(g.label)}</span>`,
+      `${fmtV(g.extremes.high.value, g.decimals)} <span style="color:var(--faint)">${escDate(g.extremes.high.date)}</span>`,
+      `${fmtV(g.extremes.low.value, g.decimals)} <span style="color:var(--faint)">${escDate(g.extremes.low.date)}</span>`,
+      `${cov(g)} <span style="color:var(--faint)">${g.n.toLocaleString('en-CA')}</span>`,
+    ]), ['Gauge', `Highest (${gauges[0].unit})`, `Lowest (${gauges[0].unit})`, 'Record'])}
+  </div>`;
+
+  const swingTable = (gauges, heading) => {
+    const rows = [];
+    for (const g of gauges) {
+      const rise = g.swings.rises[0], fall = g.swings.falls[0];
+      if (!rise && !fall) continue;
+      rows.push([
+        `${esc(g.name)}`,
+        rise ? `+${fmtV(rise.change, g.decimals)} <span style="color:var(--faint)">to ${escDate(rise.to)}</span>` : '—',
+        fall ? `${fmtV(fall.change, g.decimals)} <span style="color:var(--faint)">to ${escDate(fall.to)}</span>` : '—',
+        cov(g),
+      ]);
+    }
+    return rows.length === 0 ? '' : `
+  <div class="section">
+    <h2>${heading}</h2>
+    ${kvTable(rows, ['Gauge', 'Largest 7-day rise', 'Largest 7-day fall', 'Record'])}
+  </div>`;
+  };
+
+  const onDate = (gauges) => {
+    const rows = gauges.filter(g => g.onThisDate).map(g => {
+      const o = g.onThisDate;
+      return [
+        `${esc(g.name)}`,
+        fmtV(o.median, g.decimals),
+        `${fmtV(o.high.value, g.decimals)} <span style="color:var(--faint)">${o.high.date.substring(0, 4)}</span>`,
+        `${fmtV(o.low.value, g.decimals)} <span style="color:var(--faint)">${o.low.date.substring(0, 4)}</span>`,
+        `${o.n} yrs`,
+      ];
+    });
+    return rows.length ? kvTable(rows, ['Gauge', 'Typical', 'Highest', 'Lowest', 'Seen']) : '';
+  };
+
+  const body = `
+  <div class="cards">
+    ${card(`
+      <h2>Highest water ever recorded</h2>
+      <div class="big num">${fmtV(r.levels[0]?.extremes.high.value, 3)}<span class="unit">m</span></div>
+      <div class="asof">${esc(r.levels[0]?.name ?? '')} &middot; ${escDate(r.levels[0]?.extremes.high.date ?? '')}</div>
+      <p class="lede">${(() => {
+        // Derive this rather than assert it: four gauges peaked in 2019 but
+        // Port Carling's high is from 2013, and a hand-written sentence about
+        // "every gauge" was simply wrong.
+        const years = r.levels.map(g => g.extremes.high.date.substring(0, 4));
+        const top = years[0];
+        const same = years.filter(y => y === top).length;
+        const odd = r.levels.filter(g => g.extremes.high.date.substring(0, 4) !== top);
+        if (same === years.length) return `Every level gauge on this page peaked in ${top}.`;
+        return `${same} of the ${years.length} level gauges peaked in ${top}. `
+          + odd.map(g => `${esc(g.name)}'s high came in ${g.extremes.high.date.substring(0, 4)}`).join('; ') + '.';
+      })()}</p>
+    `)}
+    ${card(`
+      <h2>Warmest water ever recorded</h2>
+      <div class="big num">${fmtV(t.extremes.high.value, 1)}<span class="unit">°C</span></div>
+      <div class="asof">${escDate(t.extremes.high.date)}</div>
+      <p class="lede">Coldest was ${fmtV(t.extremes.low.value, 1)} °C on ${escDate(t.extremes.low.date)}, across ${t.years} years of satellite readings.</p>
+    `)}
+    ${t.swimStreak ? card(`
+      <h2>Longest stretch above 20 °C</h2>
+      <div class="big num">${t.swimStreak.length}<span class="unit">days</span></div>
+      <div class="asof">${escDate(t.swimStreak.start)} to ${escDate(t.swimStreak.end)}</div>
+      <p class="lede">The longest continuous run of swimmable water in the record.</p>
+    `) : ''}
+  </div>
+
+  ${gaugeTable(r.levels, 'Water level records')}
+  ${gaugeTable(r.flow, 'River flow records')}
+  ${swingTable(r.levels, 'Biggest level swings')}
+  ${swingTable(r.flow, 'Biggest flow swings')}
+
+  <div class="section">
+    <h2>Temperature records</h2>
+    ${kvTable([
+      ['Warmest reading', `${fmtV(t.extremes.high.value, 1)} °C`, escDate(t.extremes.high.date)],
+      ['Coldest reading', `${fmtV(t.extremes.low.value, 1)} °C`, escDate(t.extremes.low.date)],
+      ...t.warmestYears.slice(0, 3).map((y, i) => [`${ordinal(i + 1)} warmest year`, `${fmtV(y[1], 1)} °C`, String(y[0])]),
+      ...t.coolestYears.slice(0, 3).map((y, i) => [`${ordinal(i + 1)} coolest year`, `${fmtV(y[1], 1)} °C`, String(y[0])]),
+    ], ['', 'Value', 'When'])}
+    <p class="lede">Yearly figures use only years with at least 350 readings, so a partial year cannot win on a short warm sample.</p>
+  </div>
+
+  <div class="section">
+    <h2>On this date &middot; ${escDate(r.meta.generated)}</h2>
+    ${t.onThisDate ? kvTable([[
+      'Water temperature',
+      `${fmtV(t.onThisDate.median, 1)} °C`,
+      `${fmtV(t.onThisDate.high.value, 1)} <span style="color:var(--faint)">${t.onThisDate.high.date.substring(0, 4)}</span>`,
+      `${fmtV(t.onThisDate.low.value, 1)} <span style="color:var(--faint)">${t.onThisDate.low.date.substring(0, 4)}</span>`,
+      `${t.onThisDate.n} yrs`,
+    ]], ['Series', 'Typical', 'Highest', 'Lowest', 'Seen']) : ''}
+    ${onDate(r.levels)}
+    ${onDate(r.flow)}
+    <p class="lede">Every reading ever taken on this exact calendar date, not a pooled window.</p>
+  </div>
+
+  ${explain('Why these records are not equally impressive', `
+    <p>Coverage is very uneven. Port Sydney's flow gauge has run since 1915, so its record low genuinely survived a century. Three other flow gauges only start in 2021, so their "records" describe about five years.</p>
+    <p>Every row above carries its period of record for that reason. A record high off five years and one off a hundred are not the same claim, and nothing here averages them together.</p>
+    <p>Level readings are daily means published by Environment and Climate Change Canada, so a brief peak within a day is smoothed away — the true instantaneous crest in 2019 was higher than the figure shown. Temperatures are satellite surface readings, not a thermometer in the water.</p>`)}`;
+
+  return page({
+    file: 'records.html', title: 'Muskoka Tracker — records',
+    heading: 'Records',
+    sub: `Extremes across every gauge, from ${escDate(r.flow.concat(r.levels).map(g => g.firstDate).sort()[0])} to today.`,
+    body, script: '',
+  });
 }
 
 function aboutPage(temp, levels, flow) {
@@ -487,6 +639,7 @@ async function main() {
   const levels = buildLevelsPayload(cache, TODAY_ISO);
   const flow = buildFlowPayload(cache, TODAY_ISO);
   const overview = buildOverviewPayload(temp, levels, flow, TODAY_ISO);
+  const records = buildRecordsPayload(temps, cache, TODAY_ISO);
 
   console.log(`  ${temps.length} temperature readings, ${temp.meta.years} years`);
   console.log(`  ${levels.stations.length} level gauges, ${flow.stations.length} flow gauges` +
@@ -500,6 +653,7 @@ async function main() {
   await writeJSON('temperature-allyears.json', allYears);
   await writeJSON('levels.json', levels);
   await writeJSON('flow.json', flow);
+  await writeJSON('records.json', records);
 
   const pages = {
     'index.html': indexPage(overview, temp),
@@ -517,6 +671,7 @@ async function main() {
       note: flow.omitted.length ? `<div class="notice">${flow.omitted.map(g =>
         `Gauge ${esc(g.id)} (${esc(g.name)}) is not shown: it stopped reporting after ${escDate(g.lastDate)}.`).join(' ')}</div>` : '',
     }),
+    'records.html': recordsPage(records),
     'about.html': aboutPage(temp, levels, flow),
   };
 

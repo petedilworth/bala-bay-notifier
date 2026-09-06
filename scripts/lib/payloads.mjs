@@ -76,34 +76,67 @@ function trailingMean(days, n) {
   return window.reduce((a, d) => a + d.value, 0) / window.length;
 }
 
-// ── temperature ──
+// ── day-of-year normals ──
 
-// Per-day-of-year envelope across every year but the current one. This is the
-// climatology the current year is read against, and it replaces shipping all
-// 8,800 readings: 366 rows instead of 25 years of dailies.
-export function climatology(records, currentYear) {
+// Attach year and day-of-year to a plain {date, value} archive reading. Same
+// arithmetic as toRecord() in notify.mjs, which names its value `tempC`; the
+// maths was never temperature-specific, only the label.
+//
+// Day-of-year is not leap-adjusted, so a date can shift by one between leap and
+// common years. The ±3-day pooling window absorbs that.
+export function withDayOfYear(dateStr, value) {
+  const year = parseInt(dateStr.substring(0, 4), 10);
+  const dt = new Date(dateStr + 'T00:00:00Z');
+  const jan1 = new Date(Date.UTC(year, 0, 1));
+  return { date: dateStr, year, dayOfYear: Math.floor((dt - jan1) / 86400000) + 1, value };
+}
+
+// Per-day-of-year envelope across every year but the current one: 366 rows of
+// [day, min, p25, median, p75, max] instead of the whole record. This is what
+// "normal for this date" means everywhere on the site.
+//
+// Generic over the value accessor and rounding because level needs 3 decimals
+// (Bala spans 224.28-226.05 m, so 1 decimal would flatten it to nothing) while
+// temperature wants 1.
+// `pick`, not `valueOf`: every object inherits Object.prototype.valueOf, so an
+// option of that name is never undefined and the ?? fallback silently never
+// fires — you get Object.prototype.valueOf called with no `this`.
+export function dayOfYearEnvelope(records, currentYear, opts = {}) {
+  const pick = opts.pick ?? (r => r.value);
+  const round = opts.round ?? r3;
+  const halfWindow = opts.halfWindow ?? 3;
+
   const buckets = new Map();
   for (const r of records) {
     if (r.year === currentYear) continue;
+    const v = pick(r);
+    if (!Number.isFinite(v)) continue;
     if (!buckets.has(r.dayOfYear)) buckets.set(r.dayOfYear, []);
-    buckets.get(r.dayOfYear).push(r.tempC);
+    buckets.get(r.dayOfYear).push(v);
   }
   const rows = [];
   for (let day = 1; day <= 366; day++) {
-    // ±3 days, matching computeTodayTempStats, so a single noisy satellite
-    // reading can't put a notch in the envelope
+    // Pooling a window rather than a single day stops one noisy reading from
+    // putting a notch in the envelope. Wraps across the Dec/Jan boundary.
     const pool = [];
-    for (let d = -3; d <= 3; d++) {
+    for (let d = -halfWindow; d <= halfWindow; d++) {
       const k = ((day - 1 + d + 366) % 366) + 1;
       const b = buckets.get(k);
       if (b) pool.push(...b);
     }
     if (pool.length === 0) { rows.push([day, null, null, null, null, null]); continue; }
     const s = pool.sort((a, b) => a - b);
-    rows.push([day, r1(s[0]), r1(quantile(s, 0.25)), r1(quantile(s, 0.5)),
-      r1(quantile(s, 0.75)), r1(s[s.length - 1])]);
+    rows.push([day, round(s[0]), round(quantile(s, 0.25)), round(quantile(s, 0.5)),
+      round(quantile(s, 0.75)), round(s[s.length - 1])]);
   }
   return rows;
+}
+
+// ── temperature ──
+
+// The temperature flavour of the same envelope.
+export function climatology(records, currentYear) {
+  return dayOfYearEnvelope(records, currentYear, { pick: r => r.tempC, round: r1 });
 }
 
 export function buildTemperaturePayload(records, currentYear, todayIso) {
@@ -190,6 +223,74 @@ export function buildAllYearsPayload(records, currentYear) {
   };
 }
 
+// ── records ──
+
+// distribution() already yields the all-time min and max, but drops the dates,
+// which is exactly what a records page needs. These fill that gap.
+export function extremes(days) {
+  if (!days || days.length === 0) return null;
+  let high = days[0], low = days[0];
+  for (const d of days) {
+    if (d.value > high.value) high = d;
+    if (d.value < low.value) low = d;
+  }
+  return {
+    high: { date: high.date, value: r3(high.value) },
+    low: { date: low.date, value: r3(low.value) },
+  };
+}
+
+// Largest rises and falls over a rolling window. Compares by date rather than
+// by row so a gap in the record cannot masquerade as a sudden swing: a pair
+// whose dates are further apart than the window is skipped.
+export function biggestSwings(days, windowDays, n = 5) {
+  if (!days || days.length < 2) return { rises: [], falls: [] };
+  const byDate = new Map(days.map(d => [d.date, d.value]));
+  const swings = [];
+  for (const d of days) {
+    const from = addDays(d.date, -windowDays);
+    const prev = byDate.get(from);
+    if (prev === undefined) continue;
+    swings.push({ from, to: d.date, change: d.value - prev, fromValue: r3(prev), toValue: r3(d.value) });
+  }
+  const sorted = [...swings].sort((a, b) => b.change - a.change);
+  const shape = (x) => ({ ...x, change: r3(x.change) });
+  return {
+    rises: sorted.slice(0, n).filter(x => x.change > 0).map(shape),
+    falls: sorted.slice(-n).reverse().filter(x => x.change < 0).map(shape),
+  };
+}
+
+// Longest run of consecutive days satisfying `test`. Consecutive by date, so a
+// hole in the record ends the run rather than being bridged.
+export function longestStreak(days, test) {
+  let best = null, run = null;
+  for (const d of days) {
+    const ok = test(d.value);
+    const contiguous = run && daysBetween(d.date, run.end) === 1;
+    if (ok && contiguous) { run.end = d.date; run.length++; }
+    else if (ok) run = { start: d.date, end: d.date, length: 1 };
+    else run = null;
+    if (run && (!best || run.length > best.length)) best = { ...run };
+  }
+  return best;
+}
+
+// Every reading ever taken on this calendar date (±0 days — the exact date),
+// so "on this date" means what it says.
+export function onThisDate(days, monthDay) {
+  const hits = days.filter(d => d.date.substring(5) === monthDay);
+  if (hits.length === 0) return null;
+  const values = hits.map(d => d.value);
+  const ex = extremes(hits);
+  return {
+    n: hits.length,
+    earliestYear: parseInt(hits[0].date.substring(0, 4), 10),
+    latestYear: parseInt(hits[hits.length - 1].date.substring(0, 4), 10),
+    high: ex.high, low: ex.low, median: r3(median(values)),
+  };
+}
+
 // ── levels and flow ──
 
 // The "vs July avg" figure both surfaces quote is explicitly a FIVE-year
@@ -226,6 +327,46 @@ function monthlyMeans(days) {
 }
 
 const DAILY_YEARS = 2; // full-resolution window shipped to the browser
+
+// A normal needs several years behind it to mean anything. Four flow gauges
+// currently hold about five years and one dormant gauge holds a single year;
+// a band drawn from one winter would be worse than no band at all.
+const MIN_YEARS_FOR_NORMAL = 3;
+
+// How today compares to normal for its own calendar date, plus the 366-row
+// envelope the chart shades. Returns null when the record is too shallow, and
+// the card then falls back to the July comparison alone.
+function dateNormal(days, latest, currentYear, measure) {
+  const records = days.map(d => withDayOfYear(d.date, d.value));
+  const priorYears = new Set(records.filter(r => r.year !== currentYear).map(r => r.year));
+  if (priorYears.size < MIN_YEARS_FOR_NORMAL) return null;
+
+  const envelope = dayOfYearEnvelope(records, currentYear);
+  const today = withDayOfYear(latest.date, latest.value);
+  const row = envelope[today.dayOfYear - 1];
+  if (!row || row[3] === null) return null;
+
+  // Same ±3-day pool the envelope uses, so the percentile and the band agree.
+  const pool = [];
+  for (let d = -3; d <= 3; d++) {
+    const k = ((today.dayOfYear - 1 + d + 366) % 366) + 1;
+    for (const r of records) if (r.year !== currentYear && r.dayOfYear === k) pool.push(r.value);
+  }
+  const med = row[3];
+
+  return {
+    envelope,
+    dayOfYear: today.dayOfYear,
+    min: row[1], p25: row[2], median: med, p75: row[4], max: row[5],
+    n: pool.length, years: priorYears.size,
+    earliestYear: Math.min(...priorYears), latestYear: Math.max(...priorYears),
+    percentile: percentileOf(pool, latest.value),
+    // Same measure split as the July comparison: a difference in inches for
+    // level, a ratio for flow.
+    vsNormalIn: measure === 'level' ? r1((latest.value - med) * 100 / CM_PER_INCH) : null,
+    vsNormalPct: (measure === 'flow' && med !== 0) ? Math.round((latest.value / med) * 100) : null,
+  };
+}
 
 function stationBlock(st, days, { unit, format, decimals, measure }, currentYear) {
   const latest = days[days.length - 1];
@@ -267,6 +408,10 @@ function stationBlock(st, days, { unit, format, decimals, measure }, currentYear
     years: Math.max(1, Math.round((new Date(latest.date) - new Date(days[0].date)) / 31557600000)),
     series: days.filter(d => d.date >= dailyFrom).map(d => [d.date, r3(d.value)]),
     monthly: monthlyMeans(days),
+    // Second comparison, beside the July one: how today sits against normal for
+    // its own calendar date. "vs July avg" applies a single summer number to all
+    // 365 days, so it says little in February.
+    normal: dateNormal(days, latest, currentYear, measure),
   };
 }
 
@@ -337,6 +482,71 @@ export function windowByDate(rows, days) {
   if (rows.length === 0) return rows;
   const cutoff = addDays(rows[rows.length - 1][0], -(days - 1));
   return rows.filter(r => r[0] >= cutoff);
+}
+
+// Records across every archived series. Coverage is wildly uneven — Port
+// Sydney's flow reaches 1915 while three other flow gauges start in 2021 — so
+// every entry carries its own period of record. A "record high" off five years
+// and one off a century are not the same claim.
+export function buildRecordsPayload(temps, cache, todayIso) {
+  const monthDay = todayIso.substring(5);
+  const gauge = (st, key, unit, format, decimals, measure) => {
+    const days = seriesFrom(cache, key);
+    if (days.length === 0) return null;
+    // Same staleness rule the flow page uses: a dormant gauge's last reading is
+    // not a current record.
+    if (measure === 'flow' && daysBetween(todayIso, days[days.length - 1].date) > 90) return null;
+    return {
+      id: st.id, name: st.name, label: st.label, unit, format, decimals, measure,
+      firstDate: days[0].date, lastDate: days[days.length - 1].date, n: days.length,
+      years: Math.max(1, Math.round(
+        (new Date(days[days.length - 1].date) - new Date(days[0].date)) / 31557600000)),
+      extremes: extremes(days),
+      swings: biggestSwings(days, 7, 5),
+      onThisDate: onThisDate(days, monthDay),
+    };
+  };
+
+  const levels = LEVEL_STATIONS
+    .map(st => gauge(st, `level:${st.id}`, 'm', 'f3', 3, 'level')).filter(Boolean);
+  const flow = FLOW_STATIONS
+    .map(st => gauge(st, `flow:${st.id}`, 'm³/s', 'f1', 1, 'flow')).filter(Boolean);
+
+  // Temperature records come from the satellite archive rather than a gauge.
+  const tempDays = temps.map(r => ({ date: r.date, value: r.tempC }));
+  const byYear = new Map();
+  for (const r of temps) {
+    if (!byYear.has(r.year)) byYear.set(r.year, []);
+    byYear.get(r.year).push(r.tempC);
+  }
+  // Partial years average fewer days and are not comparable, so rank only the
+  // years with near-complete coverage.
+  const fullYears = [...byYear.entries()]
+    .filter(([, v]) => v.length >= 350)
+    .map(([y, v]) => [y, r1(v.reduce((a, b) => a + b, 0) / v.length), v.length])
+    .sort((a, b) => b[1] - a[1]);
+
+  return {
+    meta: { generated: todayIso, monthDay },
+    levels, flow,
+    temperature: {
+      firstDate: temps[0].date, lastDate: temps[temps.length - 1].date,
+      n: temps.length, years: byYear.size,
+      extremes: (() => {
+        const e = extremes(tempDays);
+        return { high: { ...e.high, value: r1(e.high.value) }, low: { ...e.low, value: r1(e.low.value) } };
+      })(),
+      warmestYears: fullYears.slice(0, 5),
+      coolestYears: fullYears.slice(-5).reverse(),
+      swimStreak: longestStreak(tempDays, v => v >= 20),
+      onThisDate: (() => {
+        const o = onThisDate(tempDays, monthDay);
+        return o && { ...o, median: r1(o.median),
+          high: { ...o.high, value: r1(o.high.value) },
+          low: { ...o.low, value: r1(o.low.value) } };
+      })(),
+    },
+  };
 }
 
 export function buildOverviewPayload(temp, levels, flow, todayIso) {

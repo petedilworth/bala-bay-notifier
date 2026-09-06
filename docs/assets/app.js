@@ -258,6 +258,13 @@
     });
   }
 
+  // Matches withDayOfYear() in payloads.mjs so the browser indexes the envelope
+  // exactly as the generator built it.
+  function dayOfYear(iso) {
+    var y = parseInt(iso.substring(0, 4), 10);
+    return Math.floor((Date.parse(iso + 'T00:00:00Z') - Date.UTC(y, 0, 1)) / 86400000) + 1;
+  }
+
   function daysApart(a, b) {
     return Math.round((Date.parse(b + 'T12:00:00Z') - Date.parse(a + 'T12:00:00Z')) / 86400000);
   }
@@ -301,7 +308,19 @@
     var values = rows.map(function (r) { return r[1]; });
     var lows = monthly ? rows.map(function (r) { return r[0] === null ? null : r[2]; }) : null;
     var highs = monthly ? rows.map(function (r) { return r[0] === null ? null : r[3]; }) : null;
-    var b = pad(values.concat(lows || [], highs || []),
+    // Include the band in the axis window so it is not clipped, but only the
+    // middle half — the all-time record range for a date can be far wider than
+    // a 90-day window and would squash the actual readings to a flat line.
+    var bandVals = [];
+    if (!monthly && station.normal && station.normal.envelope) {
+      var e = station.normal.envelope;
+      labels.forEach(function (d) {
+        if (!d) return;
+        var row = e[dayOfYear(d) - 1];
+        if (row) { bandVals.push(row[2], row[4]); }
+      });
+    }
+    var b = pad(values.concat(lows || [], highs || [], bandVals),
       refLine === null || refLine === undefined ? [] : [refLine],
       0.15, station.decimals === 3 ? 0.01 : 0.1);
     // Discharge cannot go negative, and Port Sydney's record runs to 0.0 m³/s,
@@ -314,6 +333,36 @@
     if (observed.length && Math.min.apply(null, observed) >= 0 && b.min < 0) b.min = 0;
 
     var ds = [];
+
+    // "Normal for this date": the day-of-year envelope shaded behind the line,
+    // so the whole window reads against normal rather than only today's number
+    // doing so. Daily views only — the monthly view already carries its own
+    // within-month range band, and stacking the two would be unreadable.
+    if (!monthly && station.normal && station.normal.envelope) {
+      var env = station.normal.envelope;
+      var at = function (i, col) {
+        if (!labels[i]) return null;
+        var row = env[dayOfYear(labels[i]) - 1];
+        return row ? row[col] : null;
+      };
+      var band = function (label, col, fillTo, colour) {
+        return {
+          label: label,
+          data: labels.map(function (_, i) { return { x: i, y: at(i, col) }; }),
+          borderWidth: 0, pointRadius: 0, tension: 0.25, spanGaps: false,
+          fill: fillTo, backgroundColor: colour
+        };
+      };
+      ds.push(band('Record low for date', 1, false));
+      ds.push(band('Record range', 5, '-1', C.band));
+      ds.push(band('25th pct', 2, false));
+      ds.push(band('Middle half', 4, '-1', C.bandInner));
+      ds.push({
+        label: 'Normal', data: labels.map(function (_, i) { return { x: i, y: at(i, 3) }; }),
+        borderColor: C.muted, borderWidth: 1, borderDash: [4, 3],
+        pointRadius: 0, fill: false, tension: 0.25, spanGaps: false
+      });
+    }
 
     // Monthly means alone flatten the thing worth seeing: a flood or a drawdown
     // is a month whose RANGE blew out, not one whose average moved much. Draw
@@ -335,7 +384,8 @@
       label: monthly ? 'Monthly mean' : station.name,
       data: values.map(function (v, i) { return { x: i, y: v }; }),
       borderColor: C.blue, backgroundColor: C.blueSoft,
-      borderWidth: 2, fill: monthly ? false : 'start', tension: 0.25, spanGaps: false,
+      borderWidth: 2, tension: 0.25, spanGaps: false,
+      fill: (monthly || (station.normal && station.normal.envelope)) ? false : 'start',
       pointRadius: values.map(function (v, i) { return (v !== null && i === values.length - 1) ? 4 : 0; }),
       pointBackgroundColor: C.orange, pointBorderColor: '#fff', pointBorderWidth: 1.5
     });
