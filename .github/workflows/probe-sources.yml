@@ -25,4 +25,7 @@ jobs:
         env:
           # Optional. Absent, the probe reports whether the API needs one.
           DATASTREAM_API_KEY: ${{ secrets.DATASTREAM_API_KEY }}
+          # Set to any value to hit DataStream's QA host instead of production,
+          # useful for shaking out a query without touching the live service.
+          DATASTREAM_QA: ${{ vars.DATASTREAM_QA }}
         run: node scripts/probe-sources.mjs

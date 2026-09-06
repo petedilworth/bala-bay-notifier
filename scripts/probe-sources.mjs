@@ -99,48 +99,133 @@ async function probeOpg() {
 }
 
 // ── DataStream: Muskoka water quality ──
+//
+// Queries below follow datastreamapp/api-docs (docs/README.md) rather than
+// guesswork. Three things there matter and are easy to get wrong:
+//
+//   1. contains() is NOT supported. It appears in the docs only inside an HTML
+//      comment. The operators are in, eq, lt, gt, lte, gte, ne — so a location
+//      cannot be found by name substring, and the documented way to select an
+//      area is a lat/long bounding box.
+//   2. The location name field is `Name`, not `LocationName`.
+//   3. Attribution is mandatory: any published use needs the citation, licence
+//      and a link to https://doi.org/{DOI}, all of which come from /Metadata.
+//      So /Metadata is probed first, not as an afterthought.
+
+// Muskoka lakes, centred on the Bala coordinates already used for the satellite
+// temperature lookup (45.01 N, -79.6 W). Wide enough to take in Lake Muskoka,
+// Lake Rosseau and Lake Joseph.
+const MUSKOKA_BOX = {
+  latMin: '44.85', latMax: '45.40',
+  lonMin: '-79.95', lonMax: '-79.15',
+};
+
+// The docs ask for 2 requests/second and no parallelism, on pain of 429.
+const DS_GAP_MS = 600;
+const pause = (ms) => new Promise(r => setTimeout(r, ms));
+
+function summarise(rows, fields, limit = 8) {
+  for (const r of rows.slice(0, limit)) {
+    console.log('    ' + fields.map(f => r[f] ?? '—').join(' · '));
+  }
+  if (rows.length > limit) console.log(dim(`    …and ${rows.length - limit} more`));
+  if (rows[0]) console.log(dim(`    fields present: ${Object.keys(rows[0]).join(', ')}`));
+}
+
+async function dsGet(url, headers, label) {
+  const r = await get(url, { headers });
+  const status = r.ok ? ok(`HTTP ${r.status}`) : bad(`HTTP ${r.status || r.error}`);
+  console.log(`  ${label}: ${status} in ${r.ms}ms`);
+  if (r.status === 429) console.log(`  ${bad('rate limited')} — the probe is pacing at ${DS_GAP_MS}ms; slow it further`);
+  await pause(DS_GAP_MS);
+  if (!r.ok) {
+    if (r.text) console.log(dim(`    body: ${r.text.slice(0, 200).replace(/\s+/g, ' ')}`));
+    return null;
+  }
+  try {
+    const j = JSON.parse(r.text);
+    if (j['@odata.nextLink']) console.log(dim('    more pages available (@odata.nextLink present)'));
+    return j;
+  } catch {
+    console.log(dim(`    not JSON: ${r.text.slice(0, 200).replace(/\s+/g, ' ')}`));
+    return null;
+  }
+}
 
 async function probeDataStream() {
-  head('DataStream — api.datastream.org (Lake Partner / Muskoka Lake System Health)');
+  head('DataStream — Muskoka water quality');
   const key = process.env.DATASTREAM_API_KEY;
-  console.log(`  API key in env: ${key ? ok('yes') : dim('no — testing unauthenticated')}`);
+  // The QA host lets a query be shaken out without touching production.
+  const base = process.env.DATASTREAM_QA
+    ? 'https://api.qa.datastream.org/v1/odata/v4'
+    : 'https://api.datastream.org/v1/odata/v4';
+  console.log(`  host: ${base}`);
+  console.log(`  API key in env: ${key ? ok('yes') : dim('no — expect 401')}`);
+  if (!key) {
+    console.log(dim('  Request one via the "Request an API Key" form linked from'));
+    console.log(dim('  github.com/datastreamapp/api-docs, then set DATASTREAM_API_KEY.'));
+  }
   const headers = key ? { 'x-api-key': key } : {};
-  const base = 'https://api.datastream.org/v1/odata/v4';
 
-  const root = await get(base, { headers });
-  console.log(`  service root: ${root.ok ? ok(`HTTP ${root.status}`) : bad(`HTTP ${root.status || root.error}`)} in ${root.ms}ms`);
-  if (root.ok) {
-    try {
-      const j = JSON.parse(root.text);
-      const names = (j.value || []).map(v => v.name || v.url).filter(Boolean);
-      console.log(`  entity sets: ${names.length ? ok(names.join(', ')) : dim('none listed')}`);
-    } catch {
-      console.log(`  ${dim('root is not JSON:')} ${root.text.slice(0, 160).replace(/\s+/g, ' ')}`);
+  const box = `Latitude gt '${MUSKOKA_BOX.latMin}' and Latitude lt '${MUSKOKA_BOX.latMax}'`
+    + ` and Longitude gt '${MUSKOKA_BOX.lonMin}' and Longitude lt '${MUSKOKA_BOX.lonMax}'`;
+  console.log(dim(`  bounding box: ${box}`));
+
+  // 1. Which datasets cover this area, and under what licence?
+  const meta = await dsGet(
+    `${base}/Metadata?$filter=${encodeURIComponent(box)}`
+    + `&$select=${encodeURIComponent('DOI,DatasetName,DataCollectionOrganization,Citation,Licence,TemporalExtent')}`
+    + '&$top=25',
+    headers, 'Metadata (datasets covering Muskoka)');
+  if (meta) {
+    const rows = meta.value || [];
+    console.log(`    ${rows.length} dataset(s)`);
+    for (const r of rows) {
+      console.log(`    ${r.DatasetName ?? '—'}`);
+      console.log(dim(`      DOI ${r.DOI ?? '—'} · ${r.DataCollectionOrganization ?? '—'} · extent ${JSON.stringify(r.TemporalExtent ?? null)}`));
+      if (r.Licence) console.log(dim(`      licence: ${String(r.Licence).slice(0, 120)}`));
     }
-  } else if (root.status === 401 || root.status === 403) {
-    console.log(`  ${bad('authentication required')} — sign up at datastream.org for a free key,`);
-    console.log(`  ${bad('then add it as the DATASTREAM_API_KEY secret and re-run.')}`);
-    return;
+    if (rows[0]) console.log(dim(`    fields present: ${Object.keys(rows[0]).join(', ')}`));
   }
 
-  // Which Muskoka lakes are monitored, and by which programme?
-  const q = `${base}/Locations?$filter=contains(LocationName,'Muskoka')&$top=10`;
-  const locs = await get(q, { headers });
-  console.log(`  Muskoka locations query: ${locs.ok ? ok(`HTTP ${locs.status}`) : bad(`HTTP ${locs.status || locs.error}`)}`);
-  if (locs.ok) {
-    try {
-      const j = JSON.parse(locs.text);
-      const rows = j.value || [];
-      console.log(`  matched ${rows.length} locations`);
-      for (const r of rows.slice(0, 8)) {
-        console.log(`    ${r.LocationId ?? '?'} · ${r.LocationName ?? '?'} · ${r.DatasetName ?? r.DOI ?? ''}`);
+  // 2. Which monitoring locations sit inside the box?
+  const locs = await dsGet(
+    `${base}/Locations?$filter=${encodeURIComponent(box)}`
+    + `&$select=${encodeURIComponent('Id,DOI,Name,Latitude,Longitude,MonitoringLocationType')}`
+    + '&$top=50',
+    headers, 'Locations (inside the box)');
+  let sampleLocationId = null;
+  if (locs) {
+    const rows = locs.value || [];
+    console.log(`    ${rows.length} location(s)`);
+    summarise(rows, ['Id', 'Name', 'MonitoringLocationType', 'Latitude', 'Longitude'], 12);
+    sampleLocationId = rows[0]?.Id ?? null;
+  }
+
+  // 3. What is actually measured at one of them, and over what period?
+  if (sampleLocationId !== null) {
+    const obs = await dsGet(
+      `${base}/Observations?$filter=${encodeURIComponent(`LocationId eq '${sampleLocationId}'`)}`
+      + `&$select=${encodeURIComponent('CharacteristicName,ResultValue,ResultUnit,ActivityStartDate,ActivityDepthHeightMeasure')}`
+      + '&$top=200',
+      headers, `Observations at location ${sampleLocationId}`);
+    if (obs) {
+      const rows = obs.value || [];
+      const byChar = new Map();
+      for (const r of rows) {
+        const k = `${r.CharacteristicName} (${r.ResultUnit ?? 'no unit'})`;
+        if (!byChar.has(k)) byChar.set(k, []);
+        byChar.get(k).push(r.ActivityStartDate);
       }
-      if (rows[0]) {
-        console.log(dim(`  field names on a Location: ${Object.keys(rows[0]).join(', ')}`));
+      console.log(`    ${rows.length} observations across ${byChar.size} characteristic(s)`);
+      for (const [k, dates] of byChar) {
+        const sorted = dates.filter(Boolean).sort();
+        console.log(`      ${k}: ${dates.length} readings, ${sorted[0] ?? '?'} → ${sorted[sorted.length - 1] ?? '?'}`);
       }
-    } catch {
-      console.log(`  ${dim('response head:')} ${locs.text.slice(0, 200).replace(/\s+/g, ' ')}`);
+      if (rows[0]) console.log(dim(`    fields present: ${Object.keys(rows[0]).join(', ')}`));
     }
+  } else {
+    console.log(dim('  no location id available, so the Observations shape stays unknown'));
   }
 }
 
