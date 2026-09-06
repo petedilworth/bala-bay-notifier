@@ -122,6 +122,8 @@ const MUSKOKA_BOX = {
 
 // The docs ask for 2 requests/second and no parallelism, on pain of 429.
 const DS_GAP_MS = 600;
+// Province-level selector from the docs' RegionId list.
+const DS_REGION = 'admin.4.ca.on';
 const pause = (ms) => new Promise(r => setTimeout(r, ms));
 
 function summarise(rows, fields, limit = 8) {
@@ -167,13 +169,20 @@ async function probeDataStream() {
   }
   const headers = key ? { 'x-api-key': key } : {};
 
-  const box = `Latitude gt '${MUSKOKA_BOX.latMin}' and Latitude lt '${MUSKOKA_BOX.latMax}'`
-    + ` and Longitude gt '${MUSKOKA_BOX.lonMin}' and Longitude lt '${MUSKOKA_BOX.lonMax}'`;
-  console.log(dim(`  bounding box: ${box}`));
+  // The docs show a lat/long bounding box under $filter generally, but neither
+  // /Metadata nor /Locations lists Latitude or Longitude in its own "Filter By"
+  // set — and filtering on them returned HTTP 400 with an empty message, so the
+  // request was rejected as malformed before authentication was even reached.
+  // RegionId IS in both Filter By lists, so select Ontario at the API and
+  // narrow to Muskoka here.
+  const region = `RegionId eq '${DS_REGION}'`;
+  console.log(dim(`  filter: ${region}, narrowed to the Muskoka box in this script`));
+  const inBox = (r) => r.Latitude >= +MUSKOKA_BOX.latMin && r.Latitude <= +MUSKOKA_BOX.latMax
+    && r.Longitude >= +MUSKOKA_BOX.lonMin && r.Longitude <= +MUSKOKA_BOX.lonMax;
 
   // 1. Which datasets cover this area, and under what licence?
   const meta = await dsGet(
-    `${base}/Metadata?$filter=${encodeURIComponent(box)}`
+    `${base}/Metadata?$filter=${encodeURIComponent(region)}`
     + `&$select=${encodeURIComponent('DOI,DatasetName,DataCollectionOrganization,Citation,Licence,TemporalExtent')}`
     + '&$top=25',
     headers, 'Metadata (datasets covering Muskoka)');
@@ -190,14 +199,15 @@ async function probeDataStream() {
 
   // 2. Which monitoring locations sit inside the box?
   const locs = await dsGet(
-    `${base}/Locations?$filter=${encodeURIComponent(box)}`
+    `${base}/Locations?$filter=${encodeURIComponent(region)}`
     + `&$select=${encodeURIComponent('Id,DOI,Name,Latitude,Longitude,MonitoringLocationType')}`
-    + '&$top=50',
-    headers, 'Locations (inside the box)');
+    + '&$top=10000',
+    headers, 'Locations (Ontario)');
   let sampleLocationId = null;
   if (locs) {
-    const rows = locs.value || [];
-    console.log(`    ${rows.length} location(s)`);
+    const all = locs.value || [];
+    const rows = all.filter(inBox);
+    console.log(`    ${all.length} in Ontario, ${rows.length} inside the Muskoka box`);
     summarise(rows, ['Id', 'Name', 'MonitoringLocationType', 'Latitude', 'Longitude'], 12);
     sampleLocationId = rows[0]?.Id ?? null;
   }
@@ -254,15 +264,23 @@ async function probeEnvironmentCanada() {
       const feats = JSON.parse(r.text).features || [];
       // Year lives under different property names across these collections, so
       // look for whichever is present rather than assuming one.
+      // Each collection names its date differently: annual-peaks and
+      // monthly-mean use DATE, annual-statistics uses MAX_DATE/MIN_DATE. An
+      // earlier version checked only DATE and reported "none parsed" for
+      // annual-statistics, then still printed "has 2026: no" — a conclusion it
+      // had not actually earned.
       const years = feats.map(f => {
         const p = f.properties || {};
-        return p.YEAR ?? p.DATE?.substring(0, 4) ?? p.MONTH?.substring(0, 4) ?? null;
+        const d = p.YEAR ?? p.DATE ?? p.MAX_DATE ?? p.MIN_DATE ?? p.MONTH ?? null;
+        return d === null ? null : String(d).substring(0, 4);
       }).filter(Boolean).map(Number).filter(Number.isFinite);
       const uniq = [...new Set(years)].sort((a, b) => a - b);
       const newest = uniq[uniq.length - 1];
       console.log(`  ${coll}: ${ok(`HTTP 200`)}, ${feats.length} features`);
       console.log(`    years present: ${uniq.length ? `${uniq[0]}–${newest}` : dim('none parsed')}`);
-      console.log(`    has 2026: ${uniq.includes(2026) ? ok('YES — this fills the gap') : bad('no')}`);
+      console.log(uniq.length === 0
+        ? `    has 2026: ${dim('unknown — no year field parsed, so this says nothing')}`
+        : `    has 2026: ${uniq.includes(2026) ? ok('YES — this fills the gap') : bad('no')}`);
       if (feats[0]) console.log(dim(`    properties: ${Object.keys(feats[0].properties || {}).join(', ')}`));
     } catch (e) {
       console.log(`  ${coll}: ${dim('unparseable: ' + e.message)}`);
@@ -274,7 +292,20 @@ async function probeEnvironmentCanada() {
   // the OGC API. Check the rules before considering it, same as for OPG.
   head('Water Office — historical realtime downloads');
   await robots('https://wateroffice.ec.gc.ca', '/download/');
-  console.log(dim('  Reported only. No fetching here until the rules above are read.'));
+  // robots permits /download/, so look at what the page offers rather than
+  // guessing an endpoint. Still reporting only: nothing is parsed or stored.
+  for (const path of ['/download/index_e.html', '/search/historical_e.html']) {
+    const r = await get('https://wateroffice.ec.gc.ca' + path);
+    console.log(`  ${path}: ${r.ok ? ok(`HTTP ${r.status}`) : bad(`HTTP ${r.status || r.error}`)}`);
+    if (!r.ok) continue;
+    const forms = [...new Set((r.text.match(/<form[^>]*action=["']([^"']+)["']/gi) || [])
+      .map(m => m.replace(/.*action=["']/i, '').replace(/["']$/, '')))].slice(0, 8);
+    const csv = [...new Set((r.text.match(/href=["']([^"']*(?:csv|download)[^"']*)["']/gi) || [])
+      .map(m => m.replace(/.*href=["']/i, '').replace(/["']$/, '')))].slice(0, 8);
+    console.log(`    form actions: ${forms.length ? forms.join(', ') : dim('none')}`);
+    console.log(`    csv/download links: ${csv.length ? csv.join(', ') : dim('none')}`);
+    await pause(500);
+  }
 }
 
 // A sandbox egress proxy also answers 403, which looks identical to a service
