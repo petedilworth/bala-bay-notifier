@@ -31,15 +31,23 @@
   <h2 style="margin:0 0 2px;font-size:22px;">Records</h2>
   <p style="margin:0 0 18px;color:var(--muted);font-size:13px;">Extremes across every gauge, from Jun 16, 1915 to today.</p>
 
+  <div class="notice">
+    <strong>These records do not include this spring.</strong>
+    Every gauge is missing Jan 1, 2026 to Jun 6, 2026, and most are missing back to Jan 1, 2025.
+    Environment Canada publishes its daily-mean series on a lag of a year or
+    more, and this site only began keeping its own readings on
+    Jun 7, 2026. A high-water event inside that window would
+    not appear below. The gap fills itself once Environment Canada publishes.
+  </div>
   <div class="cards">
     <div class="card">
-      <h2>Highest water ever recorded</h2>
+      <h2>Highest in the published record</h2>
       <div class="big num">226.051<span class="unit">m</span></div>
-      <div class="asof">Bala &middot; May 3, 2019</div>
+      <div class="asof">Bala &middot; May 3, 2019 &middot; excludes the gap above</div>
       <p class="lede">4 of the 5 level gauges peaked in 2019. Port Carling's high came in 2013.</p>
     </div>
     <div class="card">
-      <h2>Warmest water ever recorded</h2>
+      <h2>Warmest water on record</h2>
       <div class="big num">25.2<span class="unit">°C</span></div>
       <div class="asof">Aug 4, 2024</div>
       <p class="lede">Coldest was -1.8 °C on Feb 6, 2004, across 25 years of satellite readings.</p>
@@ -142,7 +150,8 @@
   <details class="explain"><summary>Why these records are not equally impressive</summary><div class="body">
     <p>Coverage is very uneven. Port Sydney's flow gauge has run since 1915, so its record low genuinely survived a century. Three other flow gauges only start in 2021, so their "records" describe about five years.</p>
     <p>Every row above carries its period of record for that reason. A record high off five years and one off a hundred are not the same claim, and nothing here averages them together.</p>
-    <p>Level readings are daily means published by Environment and Climate Change Canada, so a brief peak within a day is smoothed away — the true instantaneous crest in 2019 was higher than the figure shown. Temperatures are satellite surface readings, not a thermometer in the water.</p></div></details>
+    <p>Level readings are daily means published by Environment and Climate Change Canada, so a brief peak within a day is smoothed away — the true instantaneous crest in 2019 was higher than the figure shown. Temperatures are satellite surface readings, not a thermometer in the water.</p>
+    <p><strong>The published series also lags.</strong> Environment Canada releases each station's daily means on its own schedule, often a year or more behind, and this site's own record only starts when it began caching readings. That leaves the window named at the top of this page with no data at all, so any peak inside it is absent from every figure here. Nothing on this page is wrong about the days it can see; it simply cannot see those days. The gap closes on its own as the daily means are published, because each run re-requests the last five years rather than only new dates.</p></div></details>
   <footer class="site">
     Gauge data: Environment and Climate Change Canada, MSC GeoMet (station 02EB015 and neighbours).
     Water temperature: NOAA MUR SST v4.1 satellite analysis.<br>

@@ -9,7 +9,7 @@
 import fs from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import {
-  TODAY_ISO, CURRENT_YEAR, STATION, daysBetween, ordinal,
+  TODAY_ISO, CURRENT_YEAR, STATION, daysBetween, ordinal, addDays,
 } from '../notify.mjs';
 import {
   loadTemps, loadLevelCache, buildTemperaturePayload, buildAllYearsPayload,
@@ -502,12 +502,26 @@ function recordsPage(r) {
     return rows.length ? kvTable(rows, ['Gauge', 'Typical', 'Highest', 'Lowest', 'Seen']) : '';
   };
 
+  const gapInfo = r.meta.coverage;
+  const coverageNotice = !gapInfo ? '' : `<div class="notice">
+    <strong>These records do not include this spring.</strong>
+    Every gauge is missing ${escDate(gapInfo.commonFrom)} to ${escDate(gapInfo.to)}${
+      gapInfo.worstFrom !== gapInfo.commonFrom
+        ? `, and most are missing back to ${escDate(gapInfo.worstFrom)}`
+        : ''}.
+    Environment Canada publishes its daily-mean series on a lag of a year or
+    more, and this site only began keeping its own readings on
+    ${escDate(addDays(gapInfo.to, 1))}. A high-water event inside that window would
+    not appear below. The gap fills itself once Environment Canada publishes.
+  </div>`;
+
   const body = `
+  ${coverageNotice}
   <div class="cards">
     ${card(`
-      <h2>Highest water ever recorded</h2>
+      <h2>Highest in the published record</h2>
       <div class="big num">${fmtV(r.levels[0]?.extremes.high.value, 3)}<span class="unit">m</span></div>
-      <div class="asof">${esc(r.levels[0]?.name ?? '')} &middot; ${escDate(r.levels[0]?.extremes.high.date ?? '')}</div>
+      <div class="asof">${esc(r.levels[0]?.name ?? '')} &middot; ${escDate(r.levels[0]?.extremes.high.date ?? '')}${gapInfo ? ' &middot; excludes the gap above' : ''}</div>
       <p class="lede">${(() => {
         // Derive this rather than assert it: four gauges peaked in 2019 but
         // Port Carling's high is from 2013, and a hand-written sentence about
@@ -522,7 +536,7 @@ function recordsPage(r) {
       })()}</p>
     `)}
     ${card(`
-      <h2>Warmest water ever recorded</h2>
+      <h2>Warmest water on record</h2>
       <div class="big num">${fmtV(t.extremes.high.value, 1)}<span class="unit">°C</span></div>
       <div class="asof">${escDate(t.extremes.high.date)}</div>
       <p class="lede">Coldest was ${fmtV(t.extremes.low.value, 1)} °C on ${escDate(t.extremes.low.date)}, across ${t.years} years of satellite readings.</p>
@@ -568,7 +582,8 @@ function recordsPage(r) {
   ${explain('Why these records are not equally impressive', `
     <p>Coverage is very uneven. Port Sydney's flow gauge has run since 1915, so its record low genuinely survived a century. Three other flow gauges only start in 2021, so their "records" describe about five years.</p>
     <p>Every row above carries its period of record for that reason. A record high off five years and one off a hundred are not the same claim, and nothing here averages them together.</p>
-    <p>Level readings are daily means published by Environment and Climate Change Canada, so a brief peak within a day is smoothed away — the true instantaneous crest in 2019 was higher than the figure shown. Temperatures are satellite surface readings, not a thermometer in the water.</p>`)}`;
+    <p>Level readings are daily means published by Environment and Climate Change Canada, so a brief peak within a day is smoothed away — the true instantaneous crest in 2019 was higher than the figure shown. Temperatures are satellite surface readings, not a thermometer in the water.</p>
+    <p><strong>The published series also lags.</strong> Environment Canada releases each station's daily means on its own schedule, often a year or more behind, and this site's own record only starts when it began caching readings. That leaves the window named at the top of this page with no data at all, so any peak inside it is absent from every figure here. Nothing on this page is wrong about the days it can see; it simply cannot see those days. The gap closes on its own as the daily means are published, because each run re-requests the last five years rather than only new dates.</p>`)}`;
 
   return page({
     file: 'records.html', title: 'Muskoka Tracker — records',

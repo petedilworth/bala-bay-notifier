@@ -229,6 +229,54 @@ async function probeDataStream() {
   }
 }
 
+// ── Environment Canada: can the missing spring be had another way? ──
+//
+// The archive holds nothing between Jan 2026 and Jun 2026 because the
+// daily-mean series publishes on a long lag and this project only started
+// caching realtime readings in June. Three MSC GeoMet collections the project
+// has never called might carry the current year sooner. All three draw on
+// HYDAT, so they may lag identically — worth confirming rather than assuming.
+
+const EC_BASE = 'https://api.weather.gc.ca/collections';
+const EC_STATION = '02EB015';
+
+async function probeEnvironmentCanada() {
+  head('Environment Canada — collections not yet used (can we get spring 2026?)');
+
+  for (const coll of ['hydrometric-annual-peaks', 'hydrometric-annual-statistics', 'hydrometric-monthly-mean']) {
+    const url = `${EC_BASE}/${coll}/items?f=json&STATION_NUMBER=${EC_STATION}&limit=500`;
+    const r = await get(url);
+    if (!r.ok) {
+      console.log(`  ${coll}: ${bad(`HTTP ${r.status || r.error}`)}`);
+      continue;
+    }
+    try {
+      const feats = JSON.parse(r.text).features || [];
+      // Year lives under different property names across these collections, so
+      // look for whichever is present rather than assuming one.
+      const years = feats.map(f => {
+        const p = f.properties || {};
+        return p.YEAR ?? p.DATE?.substring(0, 4) ?? p.MONTH?.substring(0, 4) ?? null;
+      }).filter(Boolean).map(Number).filter(Number.isFinite);
+      const uniq = [...new Set(years)].sort((a, b) => a - b);
+      const newest = uniq[uniq.length - 1];
+      console.log(`  ${coll}: ${ok(`HTTP 200`)}, ${feats.length} features`);
+      console.log(`    years present: ${uniq.length ? `${uniq[0]}–${newest}` : dim('none parsed')}`);
+      console.log(`    has 2026: ${uniq.includes(2026) ? ok('YES — this fills the gap') : bad('no')}`);
+      if (feats[0]) console.log(dim(`    properties: ${Object.keys(feats[0].properties || {}).join(', ')}`));
+    } catch (e) {
+      console.log(`  ${coll}: ${dim('unparseable: ' + e.message)}`);
+    }
+    await pause(300);
+  }
+
+  // The Water Office publishes per-station realtime archives separately from
+  // the OGC API. Check the rules before considering it, same as for OPG.
+  head('Water Office — historical realtime downloads');
+  await robots('https://wateroffice.ec.gc.ca', '/download/');
+  console.log(dim('  Reported only. No fetching here until the rules above are read.'));
+}
+
 // A sandbox egress proxy also answers 403, which looks identical to a service
 // refusing us. Check a host that is certainly reachable and certainly public
 // first, so a blocked environment is reported as such instead of being
@@ -249,6 +297,7 @@ async function main() {
     console.log('"Probe data sources" Action on a GitHub runner instead.');
   }
 
+  await probeEnvironmentCanada();
   await probeOpg();
   await probeDataStream();
   console.log(`\n${'─'.repeat(70)}`);

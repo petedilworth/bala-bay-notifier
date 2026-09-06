@@ -13,8 +13,9 @@ import {
 } from '../notify.mjs';
 import {
   quantile, distribution, percentileOf, climatology, windowByDate,
-  buildLevelsPayload, buildFlowPayload,
+  buildLevelsPayload, buildFlowPayload, buildRecordsPayload,
   dayOfYearEnvelope, withDayOfYear, extremes, biggestSwings, longestStreak, onThisDate,
+  coverageGaps, recentCoverageGaps,
 } from './lib/payloads.mjs';
 
 let passed = 0;
@@ -398,5 +399,57 @@ test('onThisDate matches the exact calendar date across years', () => {
 function daysBetweenISO(a, b) {
   return Math.round((Date.parse(b + 'T12:00:00Z') - Date.parse(a + 'T12:00:00Z')) / 86400000);
 }
+
+// ── coverage ──
+// The records page reported an all-time high from 2019 while holding no data at
+// all for spring 2026. Records over a hole are a claim the data cannot support,
+// so the hole has to be detectable.
+
+test('coverage finds an interior hole and ignores the ends', () => {
+  const days = [
+    ...Array.from({ length: 10 }, (_, i) => ({ date: addDays('2025-01-01', i), value: 1 })),
+    // 150-day hole, exactly the shape of the real one
+    ...Array.from({ length: 10 }, (_, i) => ({ date: addDays('2025-06-10', i), value: 1 })),
+  ];
+  const gaps = coverageGaps(days, 5);
+  assert.equal(gaps.length, 1, 'a series simply starting and stopping is not a gap');
+  assert.equal(gaps[0].from, '2025-01-10');
+  assert.equal(gaps[0].to, '2025-06-10');
+  assert.equal(gaps[0].days, 150);
+});
+
+test('coverage ignores ordinary single missing days', () => {
+  const days = [
+    { date: '2025-01-01', value: 1 }, { date: '2025-01-03', value: 1 },
+    { date: '2025-01-04', value: 1 },
+  ];
+  assert.deepEqual(coverageGaps(days, 5), [], 'a one-day skip is not worth reporting');
+});
+
+test('only gaps recent enough to bear on a record are surfaced', () => {
+  const days = [
+    { date: '2005-01-01', value: 1 }, { date: '2006-06-01', value: 1 }, // ancient hole
+    ...Array.from({ length: 5 }, (_, i) => ({ date: addDays('2026-07-01', i), value: 1 })),
+  ];
+  const all = coverageGaps(days, 5);
+  const recent = recentCoverageGaps(days, '2026-09-06', 730);
+  assert.equal(all.length, 2);
+  assert.equal(recent.length, 1, 'a 20-year-old hole is context, not a caveat');
+  assert.equal(recent[0].to, '2026-07-01');
+});
+
+test('the records payload reports the gap it cannot see past', () => {
+  // Two years of data, then nothing for five months, then a short recent run:
+  // the shape that made "highest ever" wrong.
+  const days = [
+    ...Array.from({ length: 700 }, (_, i) => ({ date: addDays('2024-01-01', i), value: 10 })),
+    ...Array.from({ length: 30 }, (_, i) => ({ date: addDays('2026-06-07', i), value: 12 })),
+  ];
+  const temps = Array.from({ length: 400 }, (_, i) => toRecord(addDays('2025-01-01', i), 15));
+  const r = buildRecordsPayload(temps, { 'level:02EB015': days }, '2026-09-06');
+  assert.ok(r.meta.coverage, 'a five-month hole must be reported');
+  assert.equal(r.meta.coverage.to, '2026-06-06', 'last missing day');
+  assert.ok(r.meta.coverage.commonFrom > '2025-11-01', `unexpected start ${r.meta.coverage.commonFrom}`);
+});
 
 console.log(`\n${passed} passed${process.exitCode ? ' — FAILURES ABOVE' : ', 0 failed'}`);

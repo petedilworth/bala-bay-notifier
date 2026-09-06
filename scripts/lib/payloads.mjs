@@ -223,6 +223,36 @@ export function buildAllYearsPayload(records, currentYear) {
   };
 }
 
+// ── coverage ──
+
+// Interior holes in a series, longer than minGapDays. Ragged ends are not gaps
+// — a record simply starts and stops — so only the space *between* readings
+// counts.
+//
+// This exists because the records page confidently reported an all-time high
+// from 2019 while the archive held nothing at all for spring 2026: Environment
+// Canada publishes its daily-mean series on a long lag, and this project only
+// began caching realtime readings in June 2026. A record computed over a hole
+// is a claim the data cannot support, so the hole has to be stated.
+export function coverageGaps(days, minGapDays = 5) {
+  const gaps = [];
+  for (let i = 1; i < days.length; i++) {
+    const span = daysBetween(days[i].date, days[i - 1].date);
+    if (span > minGapDays) {
+      gaps.push({ from: days[i - 1].date, to: days[i].date, days: span - 1 });
+    }
+  }
+  return gaps;
+}
+
+// Gaps recent enough to matter to a "record" claim. Anything from decades ago
+// is context; a hole in the last couple of years means the record may simply
+// not have seen the event being asked about.
+export function recentCoverageGaps(days, todayIso, withinDays = 730, minGapDays = 5) {
+  const cutoff = addDays(todayIso, -withinDays);
+  return coverageGaps(days, minGapDays).filter(g => g.to >= cutoff);
+}
+
 // ── records ──
 
 // distribution() already yields the all-time min and max, but drops the dates,
@@ -504,6 +534,7 @@ export function buildRecordsPayload(temps, cache, todayIso) {
       extremes: extremes(days),
       swings: biggestSwings(days, 7, 5),
       onThisDate: onThisDate(days, monthDay),
+      gaps: recentCoverageGaps(days, todayIso),
     };
   };
 
@@ -526,8 +557,34 @@ export function buildRecordsPayload(temps, cache, todayIso) {
     .map(([y, v]) => [y, r1(v.reduce((a, b) => a + b, 0) / v.length), v.length])
     .sort((a, b) => b[1] - a[1]);
 
+  // Summarise the gap that bears on a record claim: the most recent one at each
+  // gauge. They all end the day this project began caching realtime readings,
+  // but they start at different points because Environment Canada publishes
+  // each station's daily means on its own schedule — Bala is out through 2025,
+  // most others only through 2024. Report both the window every gauge is
+  // missing and the worst case, rather than averaging them into one vague line.
+  const gauges = [...levels, ...flow];
+  const latest = gauges.map(g => g.gaps[g.gaps.length - 1]).filter(Boolean);
+  const affected = latest.length;
+  const coverage = latest.length === 0 ? null : (() => {
+    const endsAt = latest.map(g => g.to).sort().pop();
+    const atEnd = latest.filter(g => g.to === endsAt);
+    const froms = atEnd.map(g => g.from).sort();
+    return {
+      to: addDays(endsAt, -1),                  // last missing day
+      commonFrom: addDays(froms[froms.length - 1], 1), // every gauge missing from here
+      worstFrom: addDays(froms[0], 1),          // some gauges missing from here
+      commonDays: Math.min(...atEnd.map(g => g.days)),
+      worstDays: Math.max(...atEnd.map(g => g.days)),
+      gauges: affected, totalGauges: gauges.length,
+    };
+  })();
+
   return {
-    meta: { generated: todayIso, monthDay },
+    meta: {
+      generated: todayIso, monthDay,
+      coverage,
+    },
     levels, flow,
     temperature: {
       firstDate: temps[0].date, lastDate: temps[temps.length - 1].date,
